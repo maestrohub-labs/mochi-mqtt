@@ -12,13 +12,34 @@ fork; see `apps/backend/third_party/pebble/FORK.md`.
 
 | Branch | Purpose |
 | --- | --- |
-| `mh-stable` | **Default.** Last upstream release tag we adopted, plus our patches. MaestroHub consumes this via git submodule. |
+| `mh-stable` | **Default.** Last upstream release tag we adopted, plus our patches. MaestroHub consumes tagged releases of this branch as a plain `require`. |
 | `main` | The fork's mirror of upstream `main`. No edits. |
 
 ## Tag scheme
 
 `<upstream-tag>-mh.<n>` — `v2.7.9-mh.1` is the first MaestroHub release based on
 upstream v2.7.9. Rebasing onto a newer upstream tag resets the counter.
+
+## How MaestroHub consumes this fork
+
+This fork declares `module github.com/maestrohub-labs/mochi-mqtt/v2` and
+rewrites its 50 self-imports to match. MaestroHub requires that path directly:
+
+```text
+require github.com/maestrohub-labs/mochi-mqtt/v2 v2.7.9-mh.3
+```
+
+No submodule, no `replace`, no clone-time setup. It is the same shape as every
+other maestrohub-labs fork in the monorepo — `go-smb2`, `gocanopen/v2`, `fins`,
+`gos7`, `bacnet-go`.
+
+**The rename is a carried patch, not a migration.** A rebase onto a new
+upstream tag restores upstream's module line and self-imports, so it must be
+re-applied on every sync — see "Upstream sync". It is mechanical, never a merge
+decision.
+
+The three remaining references to the upstream path are in docs and an example;
+none is compiled into the module we publish.
 
 ## Patches carried
 
@@ -94,7 +115,25 @@ silently stopped counting websocket clients.
 git remote add upstream https://github.com/mochi-mqtt/server.git
 git fetch upstream --tags
 git rebase <new-tag> mh-stable     # replay patches
-go test ./... -count=1             # TestServerAddListenersFromConfig fails on
-                                   # pristine v2.7.9 too — pre-existing upstream
+
+# Re-apply the module-path rename — the rebase brings back upstream's.
+sed -i '1s#module github.com/mochi-mqtt/server/v2#module github.com/maestrohub-labs/mochi-mqtt/v2#' go.mod
+grep -rl 'github.com/mochi-mqtt/server/v2' --include='*.go' . \
+  | xargs sed -i 's#github.com/mochi-mqtt/server/v2#github.com/maestrohub-labs/mochi-mqtt/v2#g'
+git commit -am "chore: re-apply module-path rename after upstream sync"
+
+go build ./...
+go test ./... -count=1             # TestServerAddListenersFromConfig binds a
+                                   # hardcoded :1883, so it fails whenever
+                                   # anything local holds that port — including
+                                   # a running MaestroHub broker. Verified to
+                                   # fail identically on pristine upstream
+                                   # v2.7.9; not a fork regression.
+
+# Never move a published tag: the Go module proxy caches immutably, so a
+# moved tag becomes a checksum mismatch for anyone who already fetched it.
 git tag <new-tag>-mh.1 && git push origin mh-stable --tags
+
+# Then in maestrohub:
+#   go get github.com/maestrohub-labs/mochi-mqtt/v2@<new-tag>-mh.1
 ```

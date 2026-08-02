@@ -18,10 +18,10 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/mochi-mqtt/server/v2/hooks/storage"
-	"github.com/mochi-mqtt/server/v2/listeners"
-	"github.com/mochi-mqtt/server/v2/packets"
-	"github.com/mochi-mqtt/server/v2/system"
+	"github.com/maestrohub-labs/mochi-mqtt/v2/hooks/storage"
+	"github.com/maestrohub-labs/mochi-mqtt/v2/listeners"
+	"github.com/maestrohub-labs/mochi-mqtt/v2/packets"
+	"github.com/maestrohub-labs/mochi-mqtt/v2/system"
 
 	"log/slog"
 )

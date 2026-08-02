@@ -9,7 +9,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/mochi-mqtt/server/v2/mempool"
+	"github.com/maestrohub-labs/mochi-mqtt/v2/mempool"
 )
 
 const (

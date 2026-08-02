@@ -7,8 +7,8 @@ package auth
 import (
 	"testing"
 
-	"github.com/mochi-mqtt/server/v2"
-	"github.com/mochi-mqtt/server/v2/packets"
+	"github.com/maestrohub-labs/mochi-mqtt/v2"
+	"github.com/maestrohub-labs/mochi-mqtt/v2/packets"
 	"github.com/stretchr/testify/require"
 )
 

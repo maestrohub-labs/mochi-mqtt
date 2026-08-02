@@ -11,10 +11,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/mochi-mqtt/server/v2/hooks/auth"
+	"github.com/maestrohub-labs/mochi-mqtt/v2/hooks/auth"
 
-	mqtt "github.com/mochi-mqtt/server/v2"
-	"github.com/mochi-mqtt/server/v2/packets"
+	mqtt "github.com/maestrohub-labs/mochi-mqtt/v2"
+	"github.com/maestrohub-labs/mochi-mqtt/v2/packets"
 )
 
 func main() {

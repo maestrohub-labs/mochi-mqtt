@@ -9,7 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/mochi-mqtt/server/v2/packets"
+	"github.com/maestrohub-labs/mochi-mqtt/v2/packets"
 )
 
 // Inflight is a map of InflightMessage keyed on packet id.
