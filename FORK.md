@@ -60,22 +60,33 @@ an assertion, it stops.
 
 **Upstream:** report/PR pending — see the tracking issue in the monorepo.
 
-## Not carried (yet)
+### 2. `ClientsWg` incremented on the wrong goroutine — shutdown race (v2.7.9-mh.2)
 
-**WaitGroup misuse on shutdown** (monorepo issue #3506). `Listeners.CloseAll`
-reaches `ClientsWg.Wait()` while an `Add(1)` is in flight inside
-`Server.attachClient`, which `sync.WaitGroup` permits only when the counter is
-already positive. Documented failure mode is a panic on shutdown.
+`Server.attachClient` did `ClientsWg.Add(1)` on the per-connection goroutine the
+acceptor spawns, so `Listeners.CloseAll` could reach `ClientsWg.Wait()` while the
+counter was still zero and an `Add` was in flight. `sync.WaitGroup` permits `Add`
+to race `Wait` only when the counter is already positive; the documented failure
+mode is a panic, `WaitGroup misuse: Add called concurrently with Wait`.
 
-The patch proposed in #3506 — `l.ClientsWg.Add(1)` in `TCP.Serve()` — **does not
-compile**: `ClientsWg` lives on `Listeners`, and the individual listener structs
-(`TCP`, `UnixSock`, `Net`, `Websocket`) hold no reference to it. Fixing it
-properly means giving the acceptors access to the WaitGroup, and covering
-`Websocket`, which calls `establish` synchronously from its HTTP handler rather
-than from a spawned goroutine — so a fix that only touches the three raw
-acceptors would stop counting websocket clients and make `Wait()` return early.
+**Fix.** The acceptor knows a connection exists strictly earlier than the worker
+does, so the acceptor owns the counter. `Listeners.Add` hands each listener the
+WaitGroup through an optional unexported `clientCounter` interface; `TCP`,
+`UnixSock` and `Net` `Add(1)` before spawning; `Websocket` does it in its HTTP
+handler, which already runs off the accept path but must still be counted or
+`Wait()` would stop waiting for websocket clients once `attachClient` no longer
+counts them. The `Add`/`Done` pair is removed from `attachClient`.
 
-Left for a considered change rather than a rushed one.
+The interface is optional by design: a listener that does not implement it keeps
+working and is simply not waited on, which is exactly the pre-patch behaviour for
+anything `attachClient` never saw.
+
+**Note on the originally proposed patch.** MaestroHub issue #3506 proposed
+`l.ClientsWg.Add(1)` inside `TCP.Serve()`. That does not compile — `ClientsWg`
+lives on `Listeners`, and the listener structs hold no reference to it. Hence the
+`clientCounter` hand-off. The proposal also covered only `TCP`, which would have
+silently stopped counting websocket clients.
+
+**Upstream:** report/PR pending.
 
 ## Upstream sync
 
