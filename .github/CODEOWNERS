@@ -1,0 +1,3 @@
+# Fork commits get a named reviewer. Advisory until branch protection on
+# mh-stable requires code-owner review.
+* @barisvelioglu-maestrohub
