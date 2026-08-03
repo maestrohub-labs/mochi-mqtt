@@ -45,6 +45,9 @@ none is compiled into the module we publish.
 
 ### 1. `GetByListener` recursive RLock — deadlock (v2.7.9-mh.1)
 
+**Upstream PR:** https://github.com/mochi-mqtt/server/pull/507 (filed 2026-08-03).
+Drop this patch when it merges and we adopt a release containing it.
+
 `Clients.GetByListener` held `RLock` and then called `Clients.Len()`, which
 takes `RLock` again. `sync.RWMutex` documents this as prohibited:
 
@@ -82,6 +85,9 @@ an assertion, it stops.
 **Upstream:** report/PR pending — see the tracking issue in the monorepo.
 
 ### 2. `ClientsWg` incremented on the wrong goroutine — shutdown race (v2.7.9-mh.2)
+
+**Upstream PR:** https://github.com/mochi-mqtt/server/pull/508 (filed 2026-08-03).
+Drop this patch when it merges and we adopt a release containing it.
 
 `Server.attachClient` did `ClientsWg.Add(1)` on the per-connection goroutine the
 acceptor spawns, so `Listeners.CloseAll` could reach `ClientsWg.Wait()` while the
