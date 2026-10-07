@@ -81,23 +81,32 @@ func (l *TCP) Serve(establish EstablishFn) {
 			return
 		}
 
-		if atomic.LoadUint32(&l.end) == 0 {
-			// MAESTROHUB: Add on THIS goroutine, before the worker exists,
-			// so CloseAll's Wait() can never observe a zero counter with an
-			// Add in flight. See clientCounter in listeners.go.
-			if l.clientsWg != nil {
-				l.clientsWg.Add(1)
-			}
-			go func() {
-				if l.clientsWg != nil {
-					defer l.clientsWg.Done()
-				}
-				err = establish(l.id, conn)
-				if err != nil {
-					l.log.Warn("", "error", err)
-				}
-			}()
+		if atomic.LoadUint32(&l.end) == 1 {
+			// MAESTROHUB: accepted after Close began (Close sets end, then
+			// closes the clients, then the listener: a client that
+			// reconnects at once lands here). Left open, the connection is
+			// never served and never closed, so the client waits for a
+			// CONNACK until its own connect timeout. Close it: the client
+			// sees EOF and retries against the restarted listener.
+			_ = conn.Close()
+			return
 		}
+
+		// MAESTROHUB: Add on THIS goroutine, before the worker exists,
+		// so CloseAll's Wait() can never observe a zero counter with an
+		// Add in flight. See clientCounter in listeners.go.
+		if l.clientsWg != nil {
+			l.clientsWg.Add(1)
+		}
+		go func() {
+			if l.clientsWg != nil {
+				defer l.clientsWg.Done()
+			}
+			err = establish(l.id, conn)
+			if err != nil {
+				l.log.Warn("", "error", err)
+			}
+		}()
 	}
 }
 

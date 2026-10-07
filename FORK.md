@@ -31,7 +31,7 @@ This fork declares `module github.com/maestrohub-labs/mochi-mqtt/v2` and
 rewrites its 50 self-imports to match. MaestroHub requires that path directly:
 
 ```text
-require github.com/maestrohub-labs/mochi-mqtt/v2 v2.7.9-mh.5
+require github.com/maestrohub-labs/mochi-mqtt/v2 v2.7.9-mh.6
 ```
 
 No submodule, no `replace`, no clone-time setup. It is the same shape as every
@@ -175,6 +175,37 @@ accepted and silently not honoured.
 
 **Fix.** Written when off (a default server's CONNACK is byte-for-byte unchanged,
 pinned by a test), and such a SUBSCRIBE is refused with 0xA1 / 0x9E.
+
+### 6. A connection accepted while the server closes is never closed (v2.7.9-mh.6)
+
+**Upstream PR:** https://github.com/mochi-mqtt/server/pull/550 (filed 2026-10-07).
+Drop this patch when it merges and we adopt a release containing it.
+
+`Server.Close` sets the listener's `end` flag, disconnects its clients, then
+closes the listening socket. A client that reconnects the moment it is
+disconnected (paho.golang's autopaho redials with no delay on the first
+attempt) lands in that window: `Accept` returns its connection, `Serve` sees
+`end == 1` and skips `establish`, and the connection is dropped on the floor,
+open. Nobody reads it and nobody closes it, so the client waits for a CONNACK
+that never comes, until its own connect timeout (30 s for the MaestroHub MQTT
+connector) — through a broker restart that took 50 ms. `TCP`, `UnixSock` and
+`Net` all did it; `Websocket` closes its connection in a `defer`.
+
+**Impact.** Every MQTT client of the UNS embedded broker that reconnects at
+once when the broker restarts can stall for its connect timeout. In the
+MaestroHub test suite the compliance cases `Ping_RecoversAfterServerRestart`
+and `Connect_AfterLinkDeath_RealRedial` failed about one run in sixteen locally
+and more often on loaded CI runners, each on a 10 s budget.
+
+**Fix.** A connection accepted after `end` is set is closed. The client sees
+EOF, reports a failed attempt and retries after its backoff, against the
+restarted listener. Verified on the MaestroHub side: 100 of 100 runs of the
+restart case pass with the patch; 3 of 50 failed without it.
+
+**Regression test.** `listeners/shutdown_maestrohub_test.go`: `Serve` is
+blocked in `Accept`, `end` is set as `Close` would, a client dials and reads;
+the read must end with EOF promptly. Unpatched, it waits for the whole
+deadline.
 
 ## Upstream sync
 
