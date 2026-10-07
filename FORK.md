@@ -20,13 +20,18 @@ fork; see `apps/backend/third_party/pebble/FORK.md`.
 `<upstream-tag>-mh.<n>` — `v2.7.9-mh.1` is the first MaestroHub release based on
 upstream v2.7.9. Rebasing onto a newer upstream tag resets the counter.
 
+`v2.7.9-mh.4` does not exist: it was pushed with the files' contents replaced by
+their paths (a `gh api -f` instead of `-F`), deleted minutes later, and never
+consumed by a release. The Go module proxy may still hold it; a published tag is
+never moved, so the corrected release is `v2.7.9-mh.5`.
+
 ## How MaestroHub consumes this fork
 
 This fork declares `module github.com/maestrohub-labs/mochi-mqtt/v2` and
 rewrites its 50 self-imports to match. MaestroHub requires that path directly:
 
 ```text
-require github.com/maestrohub-labs/mochi-mqtt/v2 v2.7.9-mh.3
+require github.com/maestrohub-labs/mochi-mqtt/v2 v2.7.9-mh.5
 ```
 
 No submodule, no `replace`, no clone-time setup. It is the same shape as every
@@ -114,6 +119,62 @@ lives on `Listeners`, and the listener structs hold no reference to it. Hence th
 silently stopped counting websocket clients.
 
 **Upstream:** report/PR pending.
+
+### 3. A client's SUBSCRIBE packet id is refused as "in use" by the server's own outbound publish (v2.7.9-mh.5)
+
+**Upstream PR:** https://github.com/mochi-mqtt/server/pull/549 (filed 2026-10-07; one PR for patches 3–5).
+Drop these three patches when it merges and we adopt a release containing it.
+MaestroHub issue: maestrohub-labs/maestrohub#6639.
+
+`processSubscribe` and `processUnsubscribe` answered `ErrPacketIdentifierInUse`
+(0x91) whenever ANY inflight entry carried the packet identifier — including the
+server's own outbound QoS 1/2 publishes, whose identifiers the server chose from
+its own space. Per MQTT 2.2.1 the client's and the server's identifier spaces are
+independent; only the client's own inbound QoS 2 flow (held as the server's
+PUBREC, [MQTT-4.3.3-10]) can conflict, and `processPublish` already tells that
+entry apart by type.
+
+**Impact.** With both sides counting from 1, a SUBSCRIBE sent while a retained
+replay at QoS 1 was still in flight to the client was refused most of the time
+— seen as `Packet Identifier in use (0x91)` from the MaestroHub MQTT connector
+against the UNS embedded broker.
+
+**Fix.** `inboundPacketIDInUse`: the identifier is in use only when the inflight
+entry is a `Pubrec`. The two existing `PacketIDInUse` tests now model that case;
+`server_maestrohub_subscriptions_test.go` adds the outbound twin for subscribe
+and unsubscribe.
+
+### 4. The retained replay of a SUBSCRIBE carries no subscription identifier (v2.7.9-mh.5)
+
+**Upstream PR:** https://github.com/mochi-mqtt/server/pull/549. MaestroHub issue:
+maestrohub-labs/maestrohub#6637.
+
+[MQTT-3.3.4-3] requires the identifier on every message published as a result of
+the subscription, the retained ones sent at subscribe time included.
+`publishRetainedToClient` passed the decoded `Subscription`, whose `Identifiers`
+map (what `publishToClient` reads) is only filled by `Merge`, so the replay went
+out without the property while live deliveries carried it.
+
+**Impact.** The MaestroHub MQTT connector routes a SUBSCRIBE's retained replay to
+the functions that SUBSCRIBE was for by its identifier (a late joiner gets the
+retained messages, the holders do not); without the property every function on
+the filter received the replay. Any external MQTT 5 client of the UNS broker that
+routes by identifier saw the same.
+
+**Fix.** Fill `Identifiers` from `Identifier` before the replay.
+
+### 5. `SubIDAvailable` / `SharedSubAvailable` never announced nor enforced (v2.7.9-mh.5)
+
+**Upstream PR:** https://github.com/mochi-mqtt/server/pull/549. MaestroHub issue:
+maestrohub-labs/maestrohub#6638.
+
+`Capabilities.SubIDAvailable` and `SharedSubAvailable` existed but were never
+written to the CONNACK (3.2.2.3.12, 3.2.2.3.13 — absent means available), so a
+client was never told the server lacks them, and a SUBSCRIBE using them was
+accepted and silently not honoured.
+
+**Fix.** Written when off (a default server's CONNACK is byte-for-byte unchanged,
+pinned by a test), and such a SUBSCRIBE is refused with 0xA1 / 0x9E.
 
 ## Upstream sync
 
