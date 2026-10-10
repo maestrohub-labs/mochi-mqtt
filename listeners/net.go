@@ -14,12 +14,11 @@ import (
 
 // Net is a listener for establishing client connections on basic TCP protocol.
 type Net struct { // [MQTT-4.2.0-1]
-	mu        sync.Mutex
-	listener  net.Listener    // a net.Listener which will listen for new clients
-	id        string          // the internal id of the listener
-	log       *slog.Logger    // server logger
-	end       uint32          // ensure the close methods are only called once
-	clientsWg *sync.WaitGroup // MAESTROHUB: see clientCounter in listeners.go
+	mu       sync.Mutex
+	listener net.Listener // a net.Listener which will listen for new clients
+	id       string       // the internal id of the listener
+	log      *slog.Logger // server logger
+	end      uint32       // ensure the close methods are only called once
 }
 
 // NewNet initialises and returns a listener serving incoming connections on the given net.Listener
@@ -70,16 +69,7 @@ func (l *Net) Serve(establish EstablishFn) {
 			return
 		}
 
-		// MAESTROHUB: Add on THIS goroutine, before the worker exists,
-		// so CloseAll's Wait() can never observe a zero counter with an
-		// Add in flight. See clientCounter in listeners.go.
-		if l.clientsWg != nil {
-			l.clientsWg.Add(1)
-		}
 		go func() {
-			if l.clientsWg != nil {
-				defer l.clientsWg.Done()
-			}
 			err = establish(l.id, conn)
 			if err != nil {
 				l.log.Warn("", "error", err)
@@ -103,9 +93,4 @@ func (l *Net) Close(closeClients CloseFn) {
 			return
 		}
 	}
-}
-
-// setClientsWg implements clientCounter. See listeners.go.
-func (l *Net) setClientsWg(wg *sync.WaitGroup) {
-	l.clientsWg = wg
 }

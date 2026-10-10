@@ -28,10 +28,11 @@ never moved, so the corrected release is `v2.7.9-mh.5`.
 ## How MaestroHub consumes this fork
 
 This fork declares `module github.com/maestrohub-labs/mochi-mqtt/v2` and
-rewrites its 50 self-imports to match. MaestroHub requires that path directly:
+rewrites its self-imports to match (52 `.go` files at v2.7.9-mh.7; the sed in
+"Upstream sync" finds them all, so the count is informational). MaestroHub requires that path directly:
 
 ```text
-require github.com/maestrohub-labs/mochi-mqtt/v2 v2.7.9-mh.6
+require github.com/maestrohub-labs/mochi-mqtt/v2 v2.7.9-mh.7
 ```
 
 No submodule, no `replace`, no clone-time setup. It is the same shape as every
@@ -89,10 +90,20 @@ an assertion, it stops.
 
 **Upstream:** report/PR pending — see the tracking issue in the monorepo.
 
-### 2. `ClientsWg` incremented on the wrong goroutine — shutdown race (v2.7.9-mh.2)
+### 2. `ClientsWg` incremented on the wrong goroutine — shutdown race (v2.7.9-mh.2) — SUPERSEDED by patch 7 in v2.7.9-mh.7
 
-**Upstream PR:** https://github.com/mochi-mqtt/server/pull/508 (filed 2026-08-03).
-Drop this patch when it merges and we adopt a release containing it.
+**No longer carried.** The acceptor-side counting below still raced `Close`:
+an acceptor that had accepted a connection and seen the listener open could
+`Add(1)` while `Close` set `end`, closed the listener and reached `Wait()` at
+zero. The race detector reports it under patch 7's stress test. Patch 7 counts
+the connection under the lock `Server.Close` takes before `CloseAll` waits,
+which closes that window. The `clientCounter` hand-off, the listeners'
+`clientsWg` fields and their `Add`/`Done` were removed in v2.7.9-mh.7, and the
+listeners match upstream again apart from patch 6. Upstream #508 is superseded
+by https://github.com/mochi-mqtt/server/pull/551 (commented on #508, left open
+for the maintainers). The history below is kept for context.
+
+**Upstream PR:** https://github.com/mochi-mqtt/server/pull/508 (filed 2026-08-03), superseded.
 
 `Server.attachClient` did `ClientsWg.Add(1)` on the per-connection goroutine the
 acceptor spawns, so `Listeners.CloseAll` could reach `ClientsWg.Wait()` while the
@@ -206,6 +217,56 @@ restart case pass with the patch; 3 of 50 failed without it.
 blocked in `Accept`, `end` is set as `Close` would, a client dials and reads;
 the read must end with EOF promptly. Unpatched, it waits for the whole
 deadline.
+
+### 7. `Server.Close` hangs on a late CONNECT or a silent connection (v2.7.9-mh.7)
+
+**Upstream PR:** https://github.com/mochi-mqtt/server/pull/551 (filed 2026-10-11; supersedes #508,
+and includes #507's one-line `GetByListener` change verbatim because its stress test deadlocks
+without it).
+Drop this patch when it merges and we adopt a release containing it.
+
+`Close` disconnects the clients registered in `Clients`, closes each listener,
+then waits on `ClientsWg` for every connection being served. Two kinds of
+connection escaped the disconnect pass and held that wait forever:
+
+1. **Late CONNECT.** A connection accepted just before `Close` whose CONNECT
+   completes just after the disconnect pass registers (`attachClient` →
+   `Clients.Add`) too late to be disconnected, then blocks in `Client.Read` on
+   its open socket. MaestroHub's load gate caught it as a 29-minute hang. The
+   goroutine dump showed `Server.Close → Listeners.CloseAll → ClientsWg.Wait`
+   on one side and `attachClient → Client.Read` on the other.
+2. **Silent connection.** A TCP connection that never sends CONNECT has no
+   read deadline before CONNECT, so `readConnectionPacket` blocks forever, and
+   `Close` with it.
+
+**Fix.** The server tracks every connection `attachClient` is serving,
+registered or not (`connections` in `server.go`), under one mutex that also
+holds a `closing` flag. `Close` sets `closing` before any listener is closed.
+After its existing DISCONNECT pass, `closeListenerClients` stops every
+tracked connection on that listener. `attachClient` refuses and closes a
+connection that arrives once `closing` is set. A connection is therefore either
+tracked before `closing` and swept, or refused, with no window in between. The
+same lock owns the `ClientsWg` `Add`, which replaces patch 2.
+
+A pre-CONNECT deadline is set from a new `Capabilities.ConnectTimeout`
+(seconds, default 15, where 0 means the default), so a silent connection is
+dropped even when the server is not closing ([MQTT-3.1.4]: "SHOULD close the
+Network Connection" if no CONNECT arrives "within a reasonable amount of
+time"). The client's keepalive takes over once CONNECT is read.
+
+**Regression tests.** `server_close_maestrohub_test.go`. Deterministic: a
+connection accepted before `Close` sends CONNECT after the listener has
+closed; a client is held in `OnConnect` until after the sweep and then
+registers; a silent TCP connection; `attachClient` after `Close`;
+`ConnectTimeout` closes a silent connection and is lifted after CONNECT.
+Stress: `TestServerCloseRacesConnectingClients` (16 clients dialling and
+CONNECTing around each of 20 `Close`s). Unpatched, all four `Close` tests and
+the stress test hang to their 5 s budget. Patched, `-race -cpu 1,2,8
+-count=100` is clean.
+
+**MaestroHub side.** `embedded.CloseServer`, the sweep-and-timeout guard in
+`modules/uns/infrastructure/broker/embedded/close.go`, was removed when
+v2.7.9-mh.7 was adopted. Its regression test now runs against this library.
 
 ## Upstream sync
 
