@@ -268,10 +268,12 @@ the stress test hang to their 5 s budget. Patched, `-race -cpu 1,2,8
 `modules/uns/infrastructure/broker/embedded/close.go`, was removed when
 v2.7.9-mh.7 was adopted. Its regression test now runs against this library.
 
-### 8. One write(2) per PUBACK — ack coalescing and a cheap ack encoder (perf, unreleased)
+### 8. One write(2) per PUBACK — ack coalescing and a cheap ack encoder (perf, v2.7.9-mh.8)
 
-**Upstream PR:** not yet filed. The fork contract above requires one before
-this ships in a tag. The change is self-contained and not MaestroHub-specific.
+**Upstream PR:** https://github.com/mochi-mqtt/server/pull/552 (filed 2026-10-11; the
+same change rebuilt on upstream `main`, including the `TestServerProcessPublishACLCheckDeny`
+fix). It merges cleanly with #507, #508, #549, #550 and #551.
+Drop this patch when it merges and we adopt a release containing it.
 
 **Evidence.** CPU profile of MaestroHub Lite, 1,000 MQTT 5 clients publishing
 QoS 1 at 88k msg/s on 24 cores: `syscall.Syscall6` was 13.6% of all CPU, and
