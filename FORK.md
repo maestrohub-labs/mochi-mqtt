@@ -268,6 +268,80 @@ the stress test hang to their 5 s budget. Patched, `-race -cpu 1,2,8
 `modules/uns/infrastructure/broker/embedded/close.go`, was removed when
 v2.7.9-mh.7 was adopted. Its regression test now runs against this library.
 
+### 8. One write(2) per PUBACK — ack coalescing and a cheap ack encoder (perf, unreleased)
+
+**Upstream PR:** not yet filed. The fork contract above requires one before
+this ships in a tag. The change is self-contained and not MaestroHub-specific.
+
+**Evidence.** CPU profile of MaestroHub Lite, 1,000 MQTT 5 clients publishing
+QoS 1 at 88k msg/s on 24 cores: `syscall.Syscall6` was 13.6% of all CPU, and
+`Client.WritePacket` was 13.5% cumulative, 98.7% of it from `processPublish`.
+Each QoS 1 publish had its PUBACK encoded and written synchronously with its own
+`write(2)`. The existing `outbuf` only batched while WriteLoop's queue was
+non-empty, and a publisher's queue is empty. `PubackEncode` alone was 7.56 s of
+the 47.8 s, mostly spent walking every property kind through nested map
+lookups for a packet that can carry two.
+
+**Fix.**
+
+- *Coalescing* (`Client.Read`, `writeAck`). After decoding a packet, the reader
+  checks whether the next packet is already complete in its `bufio.Reader`
+  (`nextPacketBuffered`, a Peek over bytes already buffered, so no I/O). While
+  it is, success acks from `processPublish` (PUBACK/PUBREC), `processPubrec`
+  (PUBREL) and `processPubrel` (PUBCOMP) are appended to the client's existing
+  `outbuf` under the existing write lock instead of being written. The buffer is
+  flushed when any of these happens:
+  - the reader would next block on the socket (no complete packet buffered),
+  - the burst has run for `maxAckCoalesceDelay` (1 ms),
+  - `outbuf` reaches `ClientNetWriteBufferSize`, which is the same threshold
+    and the same blocking write as before,
+  - any other packet is written to the client, through any path,
+  - DISCONNECT is processed (before `Stop` closes the socket),
+  - `Read` returns.
+
+  A lone packet is acked immediately as before, because nothing is buffered
+  behind it. Ordering per client is the order of the calls, since every write
+  still goes through `outbuf` under one lock. `OnPacketSent` fires when the
+  bytes are queued, the same as the pre-existing queued-write case. Write
+  deadlines are unchanged.
+- *Ack encoder.* PUBACK/PUBREC/PUBREL/PUBCOMP with no Reason String and no User
+  Properties (or problem info disallowed) are written directly as their fixed
+  2–3 byte body. `TestEncodePubAckRelRecCompFastPathMatchesGeneral` compares
+  this byte for byte with the upstream encoder over 1,200 combinations.
+  ~620 ns → ~10 ns per PUBACK.
+- `ReadPacket` copied every inbound packet's bytes a second time, into a slice
+  that was already freshly allocated. Dropped (−1 alloc per inbound packet).
+
+**Numbers** (`ack_coalesce_bench_test.go`, real TCP listener, loopback, 32-thread
+host under unrelated load, benchstat n=8 interleaved, unpatched vs patched;
+"~" = not significant):
+
+| case (each client keeps 32 publishes in flight) | writes/msg | msg/s | ack p99 |
+| --- | --- | --- | --- |
+| 1 client | 1.00 → 0.15 | 68k → 109k (+61%) | 1.69 → 0.94 ms |
+| 50 clients | 1.00 → 0.10 | 531k → 826k (+56%) | −42% |
+| 500 clients | 1.00 → 0.10 | 703k → 983k (+40%) | ~ |
+| 1 client, 20 µs OnPublish | 1.00 → 0.065 | 25.0k → 34.5k (+38%) | −26% |
+| 50 clients, 20 µs OnPublish | 1.00 → 0.071 | 288k → 332k (+15%) | ~ |
+| 500 clients, 20 µs OnPublish | 1.00 → 0.078 | 383k → 465k (+21%) | −25% |
+| idle: one publish at a time | 1.00 → 1.00 | — | p50 9.2 → 8.5 µs ~, p99 50.2 → 49.8 µs ~ |
+
+allocs/op 11 → 10 and B/op −5% in every case.
+
+**Tests.** `ack_coalesce_tcp_test.go` (real TCP) covers: burst order with fewer
+writes, a lone publish acked immediately, a partial next packet not holding
+acks, DISCONNECT in the same segment keeping its acks, and the delay bound.
+`ack_coalesce_test.go` covers: slow-reader back-pressure bounded at the buffer
+size, held acks flushed in order by another packet, close while held, the
+`Read` exit flush, and a table for `nextPacketBuffered`. Each guard was checked
+by mutation: removing the DISCONNECT flush, the delay bound, the exit flush, or
+the partial-packet check makes its test fail.
+
+Also fixes a pre-existing flake in `TestServerProcessPublishACLCheckDeny`
+(2/20 under `-race` on the v2.7.9-mh.7 tag): it asserted `cl.Closed()` before
+waiting for `processPublish`. `Stop` closes the conn, which ends the test's
+`ReadAll`, before it marks the client closed.
+
 ## Upstream sync
 
 ```sh
