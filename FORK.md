@@ -394,8 +394,9 @@ changes value. `PublishSettlement.Withholds()` says whether an ack waits
 **Trade-off.** One client's acks wait for its slowest pending message, so a
 client's in-flight window (and the server's Receive Maximum) bounds its
 throughput by the handler's latency, as on any broker that acknowledges after
-storing. A QoS 2 PUBLISH resent while its first copy is still being handled is
-handled twice (there is no inflight entry yet to recognise it).
+storing. (Two defects of this first version are fixed in patch 10: acks were
+written on the releasing goroutine, and a QoS 2 PUBLISH resent while its first
+copy was still being handled was handled twice.)
 
 **Tests.** `acks_test.go`: ack waits for release; arrival order with
 out-of-order releases; settled prefix in one write; refusal behind a pending
@@ -405,6 +406,57 @@ back-pressure; MQTT 5 still disconnected past Receive Maximum; no hook →
 immediate ack; a second release ignored; `Withholds`/`Done`; a refusal code
 reaching an MQTT 5 client. Mutation: disabling the deferral makes
 10 of them fail.
+
+### 10. Acks are written by the client's own writer; a QoS 2 resend is not handled twice (v2.7.9-mh.10)
+
+**Upstream PR:** to be folded into patch 9's upstream PR
+(mochi-mqtt/server#553) — same feature.
+
+**Problems (independent review of patch 9, 2026-10-15).**
+
+- `ackSequencer.settle` wrote the settled acks while holding the sequencer's
+  lock, on the goroutine that released the hold. In MaestroHub that is a
+  shared worker; a client that stops reading its socket blocks the write
+  (`cl.Lock` in `writePacket`), and every worker that settles one of its
+  publishes then waits too — 7–8 of 8 workers in the reviewer's reproduction,
+  after which healthy clients' publishes ran without workers.
+- A QoS 2 PUBLISH resent while its PUBREC was held (not yet in the inflight
+  store) was handled again: on the same connection, and on the connection
+  that resumed the session after a reconnect (the reviewer's handler ran
+  twice). QoS 2 is exactly once.
+
+**Fix.**
+
+- Releasing a hold never writes. `settle` moves the settled prefix to the
+  client's `ready` list and starts its ack writer (`writeReady`), a goroutine
+  that writes in order until nothing is ready and then exits — only it can
+  block on a slow client. The server's own hold, released on the client's
+  reader at the end of `processPublish`, writes inline when no writer runs:
+  hooks that settle synchronously cost no goroutine, and the reader blocking
+  on its own client is back-pressure. A refusal decided on arrival
+  (`writeNowOrQueue`) goes behind acks that are settled but not yet written.
+  Receive quota returns when the writer has written the ack.
+- A QoS 2 PUBLISH whose packet id has a PUBREC pending on the connection is
+  answered by that PUBREC (`resumePubrec`). On a session takeover the new
+  connection adopts the old one's unwritten QoS 2 PUBRECs (`adopt`); each
+  pending ack carries its owner, so the original's release writes on the
+  connection that holds the session now, in that connection's arrival order
+  once the client resends the PUBLISH — at once if it was already settled.
+
+**Remaining window.** A PUBREC the old connection's writer already took (it is
+being written as the connection closes) is lost with that connection; the
+client's resend is then handled again. The window is one write.
+
+**Tests.** `acks_nonblocking_test.go`: a release does not block on a client
+that does not read (unread `net.Pipe`), and the acks arrive in order once it
+reads; a refusal does not overtake acks being written.
+`acks_qos2_resend_test.go`: a resend on the same connection, after a
+takeover, and after a takeover of an already settled publish — each handled
+once, answered by one PUBREC, which enters the resumed session's inflight
+store. Mutation: writing on the releasing goroutine fails the first; without
+`resumePubrec` all three QoS 2 tests fail, without `adopt` the two takeover
+ones. `-race -count=3` clean (`TestServerAddListenersFromConfig` fails on
+`mh-stable` too, unrelated).
 
 ## Upstream sync
 

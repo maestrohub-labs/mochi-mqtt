@@ -666,6 +666,9 @@ func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
 		}
 
 		existing.State.isTakenOver.Store(true)
+		// MAESTROHUB PATCH: QoS 2 PUBRECs still held on the old
+		// connection belong to the session, not the connection.
+		cl.State.acks.adopt(cl, &existing.State.acks)
 		if existing.State.Inflight.Len() > 0 {
 			cl.State.Inflight = existing.State.Inflight.Clone() // [MQTT-3.1.2-5]
 			if cl.State.Inflight.maximumReceiveQuota == 0 && cl.ops.options.Capabilities.ReceiveMaximum != 0 {
@@ -1024,6 +1027,13 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 		}
 	}
 
+	// MAESTROHUB PATCH: a QoS 2 PUBLISH resent while its first copy's
+	// PUBREC is still held (not yet in the inflight store) is answered by
+	// that PUBREC, not handled again (exactly once).
+	if !cl.Net.Inline && pk.FixedHeader.Qos == 2 && cl.State.acks.resumePubrec(cl, pk.PacketID) {
+		return nil
+	}
+
 	if pk.Properties.TopicAliasFlag && pk.Properties.TopicAlias > 0 { // [MQTT-3.3.2-11]
 		pk.TopicName = cl.State.TopicAliases.Inbound.Set(pk.Properties.TopicAlias, pk.TopicName)
 	}
@@ -1073,12 +1083,12 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 	// is put in the inflight store until the ack is written, so a session
 	// resumed meanwhile never resends an ack for a message not handled.
 	if s.hooks.Provides(OnPublishedSettle) {
-		settlement := &PublishSettlement{cl: cl, ack: cl.State.acks.reserve(ack)}
+		settlement := &PublishSettlement{cl: cl, ack: cl.State.acks.reserve(cl, ack)}
 		settlement.holds.Store(1) // the server's own, released below
 		s.publishToSubscribers(pk)
 		s.hooks.OnPublished(cl, pk)
 		s.hooks.OnPublishedSettle(cl, pk, settlement)
-		settlement.release(packets.CodeSuccess)
+		settlement.release(packets.CodeSuccess, true) // on this client's reader
 		return nil
 	}
 
