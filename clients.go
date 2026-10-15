@@ -232,7 +232,7 @@ func (cl *Client) WriteLoop() {
 	for {
 		select {
 		case <-cl.State.acks.wake:
-			cl.State.acks.writeReady(cl)
+			cl.State.acks.writeReady(cl, false)
 		case pk := <-cl.State.outbound:
 			if err := cl.WritePacket(*pk); err != nil {
 				// TODO : Figure out what to do with error
@@ -243,7 +243,7 @@ func (cl *Client) WriteLoop() {
 			// Acks handed over before the close was seen: written to a
 			// closed connection they go nowhere, but writing is reset, so
 			// the sequencer is not left busy (settle drops later ones).
-			cl.State.acks.writeReady(cl)
+			cl.State.acks.writeReady(cl, false)
 			return
 		}
 	}
@@ -712,17 +712,18 @@ func (cl *Client) writeAck(pk packets.Packet) error {
 	return cl.writePacket(pk, writeAckCoalesced)
 }
 
-// writeAcks writes acks in order with one write to the connection (or
-// none while the reader is in a burst, see writeAck): every ack but the
-// last is held in the write buffer, and the last decides like writeAck.
+// writeAcks writes acks in order with one write to the connection: every
+// ack but the last is held in the write buffer, and the last is written
+// with mode last — writeAckCoalesced on the reader (none while it is in a
+// burst, see writeAck), writeNow on WriteLoop.
 //
 // MAESTROHUB PATCH (ack after handled): the settled prefix of a client's
 // pending acks goes out together (see ackSequencer).
-func (cl *Client) writeAcks(acks []*pendingAck) error {
+func (cl *Client) writeAcks(acks []*pendingAck, last writeMode) error {
 	for i := range acks {
 		mode := writeHeld
 		if i == len(acks)-1 {
-			mode = writeAckCoalesced
+			mode = last
 		}
 		if err := cl.writePacket(acks[i].ack, mode); err != nil {
 			return err

@@ -257,7 +257,7 @@ func (q *ackSequencer) settle(cl *Client, p *pendingAck, reason packets.Code, on
 	q.writing = true
 	if onReader {
 		q.mu.Unlock()
-		q.writeReady(cl)
+		q.writeReady(cl, true)
 		q.mu.Lock() // for the deferred Unlock
 		return
 	}
@@ -286,7 +286,18 @@ func (q *ackSequencer) flushSettledLocked(cl *Client) bool {
 // returns. It runs on WriteLoop when woken, or on the reader (settle,
 // onReader); writing admits one at a time, so order holds without a lock
 // around the writes.
-func (q *ackSequencer) writeReady(cl *Client) {
+//
+// Only the reader may leave its acks in the write buffer while it is in a
+// burst (writeAckCoalesced): it flushes before it next blocks on the
+// socket. WriteLoop cannot count on that — the reader may be blocked in a
+// handler (a store run inline, waitForQuota) for as long as that takes,
+// and the acks would wait in the buffer with it — so it writes its run
+// through (writeNow).
+func (q *ackSequencer) writeReady(cl *Client, onReader bool) {
+	last := writeNow
+	if onReader {
+		last = writeAckCoalesced
+	}
 	for {
 		q.mu.Lock()
 		ready := q.ready
@@ -297,7 +308,7 @@ func (q *ackSequencer) writeReady(cl *Client) {
 			return
 		}
 		q.mu.Unlock()
-		if q.write(cl, ready) {
+		if q.write(cl, ready, last) {
 			return // disconnected: what is left is the client's to resend
 		}
 	}
@@ -305,7 +316,7 @@ func (q *ackSequencer) writeReady(cl *Client) {
 
 // write writes one run of settled acks; reports whether it ended the
 // connection (a failure an MQTT 3 client cannot be told).
-func (q *ackSequencer) write(cl *Client, ready []*pendingAck) (disconnected bool) {
+func (q *ackSequencer) write(cl *Client, ready []*pendingAck, last writeMode) (disconnected bool) {
 	// The acks are written from ready itself: no copy of each 800-byte
 	// packet per run (a run is most of a publish's garbage otherwise).
 	disconnect := false
@@ -332,8 +343,8 @@ func (q *ackSequencer) write(cl *Client, ready []*pendingAck) (disconnected bool
 	}
 
 	if len(ready) > 0 {
-		_ = cl.writeAcks(ready) // a closed client: the acks go nowhere, the client resends
-		if !cl.Closed() {       // a dead connection's session state is not this client's any more
+		_ = cl.writeAcks(ready, last) // a closed client: the acks go nowhere, the client resends
+		if !cl.Closed() {             // a dead connection's session state is not this client's any more
 			for _, r := range ready {
 				if r.reserved {
 					cl.ackWritten(r.ack)

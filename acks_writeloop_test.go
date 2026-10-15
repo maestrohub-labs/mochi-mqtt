@@ -59,3 +59,19 @@ func TestSettledAcksAfterCloseLeaveTheSequencerIdle(t *testing.T) {
 	h.release(t, 2, packets.CodeSuccess) // after the end: dropped
 	require.False(t, cl.State.acks.busy())
 }
+
+// An ack WriteLoop writes is not left in the write buffer for the reader to
+// flush: the reader may be blocked in a handler (a store run inline,
+// waitForQuota) while it holds a complete packet buffered (readAhead), and
+// the ack would wait as long as it does. (mh.9–mh.11 held it there.)
+func TestSettledAckIsNotHeldForABusyReader(t *testing.T) {
+	s, h := newSettleServer(t)
+	cl, r, _ := newTestClient()
+	cl.ops.options.ClientNetWriteBufferSize = 2048 // the server default (Options.ensureDefaults)
+	wire := readWire(r)
+
+	require.NoError(t, s.processPacket(cl, publishQos(1, 1)))
+	cl.State.readAhead.Store(true) // the reader is mid-burst, busy in a handler
+	h.release(t, 1, packets.CodeSuccess)
+	expectAck(t, wire, packets.Puback, 1)
+}
