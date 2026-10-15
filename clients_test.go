@@ -28,6 +28,13 @@ const pkInfo = "packet type %v, %s"
 var errClientStop = errors.New("test stop")
 
 func newTestClient() (cl *Client, r net.Conn, w net.Conn) {
+	cl, r, w = newTestClientNoWriteLoop()
+	go cl.WriteLoop()
+	return
+}
+
+// newTestClientNoWriteLoop is newTestClient before its WriteLoop starts.
+func newTestClientNoWriteLoop() (cl *Client, r net.Conn, w net.Conn) {
 	r, w = net.Pipe()
 
 	cl = newClient(w, &ops{
@@ -52,8 +59,6 @@ func newTestClient() (cl *Client, r net.Conn, w net.Conn) {
 	cl.State.Inflight.receiveQuota = 10
 	cl.Properties.Props.TopicAliasMaximum = 0
 	cl.Properties.Props.RequestResponseInfo = 0x1
-
-	go cl.WriteLoop()
 
 	return
 }

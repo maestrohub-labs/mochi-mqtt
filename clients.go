@@ -224,9 +224,15 @@ func newClient(c net.Conn, o *ops) *Client {
 }
 
 // WriteLoop ranges over pending outbound messages and writes them to the client connection.
+//
+// MAESTROHUB PATCH (ack after handled): it is also the client's ack writer —
+// woken by ackSequencer.settle, it writes every publish acknowledgement a
+// hook has settled (acks.go), so no goroutine is started per run of acks.
 func (cl *Client) WriteLoop() {
 	for {
 		select {
+		case <-cl.State.acks.wake:
+			cl.State.acks.writeReady(cl)
 		case pk := <-cl.State.outbound:
 			if err := cl.WritePacket(*pk); err != nil {
 				// TODO : Figure out what to do with error
@@ -234,6 +240,10 @@ func (cl *Client) WriteLoop() {
 			}
 			atomic.AddInt32(&cl.State.outboundQty, -1)
 		case <-cl.State.open.Done():
+			// Acks handed over before the close was seen: written to a
+			// closed connection they go nowhere, but writing is reset, so
+			// the sequencer is not left busy (settle drops later ones).
+			cl.State.acks.writeReady(cl)
 			return
 		}
 	}
@@ -708,13 +718,13 @@ func (cl *Client) writeAck(pk packets.Packet) error {
 //
 // MAESTROHUB PATCH (ack after handled): the settled prefix of a client's
 // pending acks goes out together (see ackSequencer).
-func (cl *Client) writeAcks(acks []packets.Packet) error {
+func (cl *Client) writeAcks(acks []*pendingAck) error {
 	for i := range acks {
 		mode := writeHeld
 		if i == len(acks)-1 {
 			mode = writeAckCoalesced
 		}
-		if err := cl.writePacket(acks[i], mode); err != nil {
+		if err := cl.writePacket(acks[i].ack, mode); err != nil {
 			return err
 		}
 	}
