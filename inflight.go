@@ -92,10 +92,13 @@ func (i *Inflight) GetAll(immediate bool) []packets.Packet {
 // NextImmediate returns the next inflight packet which is indicated to be sent immediately.
 // This typically occurs when the quota has been exhausted, and we need to wait until new quota
 // is free to continue sending.
+//
+// MAESTROHUB PATCH: no read lock of its own — GetAll takes it. Go's RWMutex
+// is not reentrant for readers: once a writer waits in Lock, the nested
+// RLock blocks behind it and the outer one never returns. With acks written
+// off the reader (acks.go), ackWritten's Set runs concurrently with the
+// reader's NextImmediate, and the two waited on each other for good.
 func (i *Inflight) NextImmediate() (packets.Packet, bool) {
-	i.RLock()
-	defer i.RUnlock()
-
 	m := i.GetAll(true)
 	if len(m) > 0 {
 		return m[0], true

@@ -49,6 +49,9 @@ type PublishSettlement struct {
 	srv  *Server
 	qos2 *qos2Entry
 	id   uint16
+	// qos2Lowered: a QoS 2 PUBLISH a hook lowered to QoS 1; its entry is
+	// dropped once settled (no PUBREL will release it).
+	qos2Lowered bool
 	// failed is the first refusal a release reported (nil: none).
 	failed atomic.Pointer[packets.Code]
 }
@@ -95,13 +98,22 @@ func (s *PublishSettlement) Done() <-chan struct{} {
 	if !s.Withholds() || s.cl.State.open == nil {
 		return nil
 	}
-	if s.qos2 != nil && s.cl.Closed() && s.srv != nil {
-		if c, ok := s.srv.Clients.Get(s.cl.ID); ok && c != s.cl && !c.Closed() && c.State.open != nil {
-			return c.State.open.Done()
+	if s.qos2 != nil && s.cl.Closed() && s.srv != nil && s.srv.qos2.holds(s.cl.ID, s.id, s.qos2) {
+		c, ok := s.srv.Clients.Get(s.cl.ID)
+		switch {
+		case ok && c != s.cl && c.State.open != nil:
+			return c.State.open.Done() // the connection that holds the session now
+		case ok && c == s.cl && s.cl.IsTakenOver():
+			// Taken over, the new connection not registered yet: the
+			// session is moving, not ended. Ask again.
+			return notDone
 		}
 	}
 	return s.cl.State.open.Done()
 }
+
+// notDone is never closed: "not gone yet" for a caller that asks Done again.
+var notDone = make(chan struct{})
 
 // release drops one hold. onReader: the caller is the client's own reader
 // (the server's hold, released at the end of processPublish), which may
@@ -123,7 +135,7 @@ func (s *PublishSettlement) release(code packets.Code, onReader bool) {
 		if onReader {
 			reader = s.cl
 		}
-		s.srv.qos2.settle(s.cl.ID, s.id, s.qos2, reason, reader)
+		s.srv.qos2.settle(s.cl.ID, s.id, s.qos2, reason, reader, s.qos2Lowered)
 		return
 	}
 	s.cl.State.acks.settle(s.cl, s.ack, reason, onReader)
@@ -169,6 +181,17 @@ func (q *ackSequencer) init() {
 // client's reader, so the queue order is the arrival order.
 func (q *ackSequencer) reserve(ack packets.Packet) *pendingAck {
 	p := &pendingAck{ack: ack, reserved: true}
+	q.mu.Lock()
+	q.pending = append(q.pending, p)
+	q.mu.Unlock()
+	return p
+}
+
+// queueAnswer appends, in arrival order, an ack that answers a resend on a
+// connection that already holds a reservation for its id (acks_qos2.go):
+// written, it returns no quota and enters nothing in the inflight store.
+func (q *ackSequencer) queueAnswer(ack packets.Packet) *pendingAck {
+	p := &pendingAck{ack: ack}
 	q.mu.Lock()
 	q.pending = append(q.pending, p)
 	q.mu.Unlock()
