@@ -342,10 +342,29 @@ func (q *ackSequencer) write(cl *Client, ready []*pendingAck, last writeMode) (d
 		q.mu.Unlock()
 	}
 
+	var failed error // an ack that could not be written on an open connection
 	if len(ready) > 0 {
-		_ = cl.writeAcks(ready, last) // a closed client: the acks go nowhere, the client resends
-		if !cl.Closed() {             // a dead connection's session state is not this client's any more
-			for _, r := range ready {
+		// A closed client: the acks go nowhere, the client resends.
+		n, err := cl.writeAcks(ready, last)
+		if err != nil && !cl.Closed() {
+			// An ack that cannot be written (too large for the client's
+			// Maximum Packet Size) cannot be skipped either: the acks
+			// behind it would overtake it ([MQTT-4.6.0-2]). Like upstream,
+			// where the reader's failed ack write ends the connection, it
+			// ends the connection: the client resends what was not
+			// acknowledged. The ones before it go out first.
+			failed = err
+			if cl.flushPending() != nil {
+				n = 0
+			}
+			q.mu.Lock()
+			q.pending, q.ready, q.writing, q.closed = nil, nil, false, true
+			q.mu.Unlock()
+		}
+		if !cl.Closed() { // a dead connection's session state is not this client's any more
+			// Only the acks written: one never sent returns no quota and
+			// completes no flow.
+			for _, r := range ready[:n] {
 				if r.reserved {
 					cl.ackWritten(r.ack)
 				}
@@ -356,8 +375,12 @@ func (q *ackSequencer) write(cl *Client, ready []*pendingAck, last writeMode) (d
 		default:
 		}
 	}
-	if disconnect {
+	switch {
+	case disconnect:
 		cl.Stop(packets.ErrUnspecifiedError)
+	case failed != nil:
+		cl.Stop(failed)
+		return true
 	}
 	return disconnect
 }

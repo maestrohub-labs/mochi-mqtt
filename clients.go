@@ -237,6 +237,11 @@ func (cl *Client) WriteLoop() {
 			if err := cl.WritePacket(*pk); err != nil {
 				// TODO : Figure out what to do with error
 				cl.ops.log.Debug("failed publishing packet", "error", err, "client", cl.ID, "packet", pk)
+				// MAESTROHUB PATCH: bytes held in the write buffer because
+				// this packet was queued (writePacket: hold while outbound is
+				// not empty) were waiting for its write to flush them; it
+				// failed before writing, so flush them now.
+				_ = cl.flushPending()
 			}
 			atomic.AddInt32(&cl.State.outboundQty, -1)
 		case <-cl.State.open.Done():
@@ -719,17 +724,22 @@ func (cl *Client) writeAck(pk packets.Packet) error {
 //
 // MAESTROHUB PATCH (ack after handled): the settled prefix of a client's
 // pending acks goes out together (see ackSequencer).
-func (cl *Client) writeAcks(acks []*pendingAck, last writeMode) error {
+//
+// It returns how many acks it wrote (to the connection, or into the write
+// buffer) before an error stopped it: an ack it could not write (too large
+// for the client's Maximum Packet Size, a connection that failed) is not
+// written, and nor is anything behind it.
+func (cl *Client) writeAcks(acks []*pendingAck, last writeMode) (int, error) {
 	for i := range acks {
 		mode := writeHeld
 		if i == len(acks)-1 {
 			mode = last
 		}
 		if err := cl.writePacket(acks[i].ack, mode); err != nil {
-			return err
+			return i, err
 		}
 	}
-	return nil
+	return len(acks), nil
 }
 
 func (cl *Client) writePacket(pk packets.Packet, mode writeMode) error {

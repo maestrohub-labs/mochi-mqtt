@@ -439,7 +439,16 @@ reaching an MQTT 5 client. Mutation: disabling the deferral makes
   packet, and acks another goroutine left there waited as long as it did. A
   connection's end resets the sequencer (WriteLoop drains what it was handed;
   `settle` drops runs for a closed client, which resends them). Runs are
-  written from `ready` itself, with no copy of each 800-byte ack packet. The server's own hold, released on the client's
+  written from `ready` itself, with no copy of each 800-byte ack packet.
+  Only the acks written count: an ack that cannot be written on an open
+  connection (larger than the client's Maximum Packet Size, a write that
+  timed out) returns no quota and completes no flow, and ends the
+  connection — the acks behind it must not overtake it, and upstream's
+  reader ends the connection on a failed ack write too; the acks before it
+  are flushed first. WriteLoop flushes the write buffer after a publish it
+  fails to write, since bytes held because that publish was queued waited
+  for its write.
+  The server's own hold, released on the client's
   reader at the end of `processPublish`, writes inline when no writer runs:
   hooks that settle synchronously cost no goroutine, and the reader blocking
   on its own client is back-pressure. A refusal decided on arrival
