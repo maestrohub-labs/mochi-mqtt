@@ -428,9 +428,18 @@ reaching an MQTT 5 client. Mutation: disabling the deferral makes
 **Fix.**
 
 - Releasing a hold never writes. `settle` moves the settled prefix to the
-  client's `ready` list and starts its ack writer (`writeReady`), a goroutine
-  that writes in order until nothing is ready and then exits — only it can
-  block on a slow client. The server's own hold, released on the client's
+  client's `ready` list and wakes the client's `WriteLoop` (the goroutine
+  that already writes its outbound publishes for the life of the
+  connection), which writes them in order (`writeReady`) — only it can block
+  on a slow client. (v2.7.9-mh.10/11 started a goroutine per run of settled
+  acks instead: thousands per second at device-ingest rates.) WriteLoop
+  writes its run through; only the reader may leave acks in the write buffer
+  for its own flush (`writeAckCoalesced`), since the reader can be blocked in
+  a handler — a store run inline, `waitForQuota` — while it holds a buffered
+  packet, and acks another goroutine left there waited as long as it did. A
+  connection's end resets the sequencer (WriteLoop drains what it was handed;
+  `settle` drops runs for a closed client, which resends them). Runs are
+  written from `ready` itself, with no copy of each 800-byte ack packet. The server's own hold, released on the client's
   reader at the end of `processPublish`, writes inline when no writer runs:
   hooks that settle synchronously cost no goroutine, and the reader blocking
   on its own client is back-pressure. A refusal decided on arrival
