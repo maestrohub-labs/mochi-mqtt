@@ -506,7 +506,7 @@ func (pk *Packet) ConnackEncode(buf *bytes.Buffer) error {
 	if pk.ProtocolVersion == 5 {
 		pb := mempool.GetBuffer()
 		defer mempool.PutBuffer(pb)
-		pk.Properties.Encode(pk.FixedHeader.Type, pk.Mods, pb, nb.Len()+2) // +SessionPresent +ReasonCode
+		pk.Properties.Encode(pk.FixedHeader.Type, pk.Mods, pb, nb.Len()) // nb holds SessionPresent and ReasonCode already (MAESTROHUB PATCH: was +2)
 		nb.Write(pb.Bytes())
 	}
 
@@ -749,7 +749,7 @@ func (pk *Packet) encodePubAckRelRecCompGeneral(buf *bytes.Buffer) error {
 	if pk.ProtocolVersion == 5 {
 		pb := mempool.GetBuffer()
 		defer mempool.PutBuffer(pb)
-		pk.Properties.Encode(pk.FixedHeader.Type, pk.Mods, pb, nb.Len())
+		pk.Properties.Encode(pk.FixedHeader.Type, pk.Mods, pb, nb.Len()+1) // +ReasonCode, written whenever there are properties (MAESTROHUB PATCH)
 		if pk.ReasonCode >= ErrUnspecifiedError.Code || pb.Len() > 1 {
 			nb.WriteByte(pk.ReasonCode)
 		}
@@ -1049,7 +1049,7 @@ func (pk *Packet) UnsubackEncode(buf *bytes.Buffer) error {
 	if pk.ProtocolVersion == 5 {
 		pb := mempool.GetBuffer()
 		defer mempool.PutBuffer(pb)
-		pk.Properties.Encode(pk.FixedHeader.Type, pk.Mods, pb, nb.Len())
+		pk.Properties.Encode(pk.FixedHeader.Type, pk.Mods, pb, nb.Len()+len(pk.ReasonCodes)) // the reason codes follow (MAESTROHUB PATCH)
 		nb.Write(pb.Bytes())
 		nb.Write(pk.ReasonCodes)
 	}

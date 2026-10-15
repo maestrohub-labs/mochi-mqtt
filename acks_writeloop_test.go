@@ -80,13 +80,20 @@ func TestSettledAckIsNotHeldForABusyReader(t *testing.T) {
 	expectAck(t, wire, packets.Puback, 1)
 }
 
-// An ack that cannot be written on an open connection — here a refusal
-// whose reason code makes the PUBACK larger than the client's Maximum
-// Packet Size (the encoder drops a reason string to fit, never the code;
-// a write that times out on a slow client is the other way) — returns no receive quota and completes no flow, and ends
-// the connection: the acks behind it must not overtake it, so the client
-// resends what was not acknowledged. The ack before it still goes out.
-// (mh.9–mh.11 counted every ack of the run as written.)
+// An ack that cannot be written on an open connection returns no receive
+// quota and completes no flow, and ends the connection: the acks behind it
+// must not overtake it, so the client resends what was not acknowledged.
+// The ack before it still goes out. (mh.9–mh.11 counted every ack of the
+// run as written.)
+//
+// Here the refusal's reason code alone (a 5-byte PUBACK) is over a 4-byte
+// Maximum Packet Size. Optional properties never cause this: the encoder
+// leaves out a Reason String or User Properties that would make the whole
+// packet too large (packets: TestOptionalPropertiesRespectTheWholePacketSize;
+// before mh.13 its check ignored the fixed header, the reason code and the
+// property length, so a packet a few bytes over the limit kept them and
+// failed here). The other real cause is a write that times out on a slow
+// client.
 func TestAckThatCannotBeWrittenIsNotCountedAndEndsTheConnection(t *testing.T) {
 	s, h := newSettleServer(t)
 	cl, r, _ := newTestClient()
@@ -112,6 +119,15 @@ func TestAckThatCannotBeWrittenIsNotCountedAndEndsTheConnection(t *testing.T) {
 	}
 	require.Equal(t, int32(8), atomic.LoadInt32(&cl.State.Inflight.receiveQuota), "quota returned for acks never sent")
 	require.False(t, cl.State.acks.busy())
+
+	// The sequencer is closed, not merely reset: nothing more is written for
+	// this connection, not even a refusal decided on arrival.
+	cl.State.acks.mu.Lock()
+	closed := cl.State.acks.closed
+	cl.State.acks.mu.Unlock()
+	require.True(t, closed, "the failure left the sequencer open")
+	require.NoError(t, cl.State.acks.writeNowOrQueue(cl, packets.Packet{FixedHeader: packets.FixedHeader{Type: packets.Puback}, PacketID: 4}),
+		"a closed sequencer writes nothing (an attempted write fails on the closed connection)")
 }
 
 // An ack held in the write buffer because a publish was queued for

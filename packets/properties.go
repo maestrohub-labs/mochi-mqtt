@@ -196,6 +196,16 @@ func (p *Properties) canEncode(pkt byte, k byte) bool {
 }
 
 // Encode encodes properties into a bytes buffer.
+//
+// n is the length of everything else in the packet's remaining length (the
+// variable header and payload without the properties). MAESTROHUB PATCH:
+// the Reason String and the User Properties are left out when the whole
+// packet — fixed header, n, the property length and the properties — would
+// otherwise be larger than mods.MaxSize, the client's Maximum Packet Size
+// ([MQTT-3.4.2-2] [MQTT-3.4.2-3] and the same rule for the other packet
+// types). Upstream compared only n and the property against the limit, so a
+// packet a few bytes over it kept the property and could not be sent at all.
+// The Reason String is kept in preference to the User Properties.
 func (p *Properties) Encode(pkt byte, mods Mods, b *bytes.Buffer, n int) {
 	if p == nil {
 		return
@@ -203,6 +213,38 @@ func (p *Properties) Encode(pkt byte, mods Mods, b *bytes.Buffer, n int) {
 
 	buf := mempool.GetBuffer()
 	defer mempool.PutBuffer(buf)
+	for _, keep := range [...]struct{ reason, user bool }{{true, true}, {true, false}, {false, true}, {false, false}} {
+		buf.Reset()
+		p.encode(pkt, mods, buf, keep.reason, keep.user)
+		if mods.MaxSize == 0 || packetSize(n, buf.Len()) <= int(mods.MaxSize) {
+			break
+		}
+	}
+
+	encodeLength(b, int64(buf.Len()))
+	b.Write(buf.Bytes()) // [MQTT-3.1.3-10]
+}
+
+// packetSize is the encoded size of a packet whose remaining length is n
+// plus a property section of propLen bytes (and its length).
+func packetSize(n, propLen int) int {
+	remaining := n + varIntLen(propLen) + propLen
+	return 1 + varIntLen(remaining) + remaining
+}
+
+// varIntLen is the length of v as a Variable Byte Integer.
+func varIntLen(v int) int {
+	l := 1
+	for v >= 128 {
+		v /= 128
+		l++
+	}
+	return l
+}
+
+// encode writes the property section without its length; reason and user
+// say whether the Reason String and the User Properties may be written.
+func (p *Properties) encode(pkt byte, mods Mods, buf *bytes.Buffer, reason, user bool) {
 	if p.canEncode(pkt, PropPayloadFormat) && p.PayloadFormatFlag {
 		buf.WriteByte(PropPayloadFormat)
 		buf.WriteByte(p.PayloadFormat)
@@ -290,12 +332,9 @@ func (p *Properties) Encode(pkt byte, mods Mods, b *bytes.Buffer, n int) {
 
 	// [MQTT-3.2.2-19] [MQTT-3.14.2-3] [MQTT-3.4.2-2] [MQTT-3.5.2-2]
 	// [MQTT-3.6.2-2] [MQTT-3.9.2-1] [MQTT-3.11.2-1] [MQTT-3.15.2-2]
-	if !mods.DisallowProblemInfo && p.canEncode(pkt, PropReasonString) && p.ReasonString != "" {
-		b := encodeString(p.ReasonString)
-		if mods.MaxSize == 0 || uint32(n+len(b)+1) < mods.MaxSize {
-			buf.WriteByte(PropReasonString)
-			buf.Write(b)
-		}
+	if reason && !mods.DisallowProblemInfo && p.canEncode(pkt, PropReasonString) && p.ReasonString != "" {
+		buf.WriteByte(PropReasonString)
+		buf.Write(encodeString(p.ReasonString))
 	}
 
 	if p.canEncode(pkt, PropReceiveMaximum) && p.ReceiveMaximum > 0 {
@@ -323,18 +362,13 @@ func (p *Properties) Encode(pkt byte, mods Mods, b *bytes.Buffer, n int) {
 		buf.WriteByte(p.RetainAvailable)
 	}
 
-	if !mods.DisallowProblemInfo && p.canEncode(pkt, PropUser) {
-		pb := mempool.GetBuffer()
-		defer mempool.PutBuffer(pb)
+	// [MQTT-3.2.2-20] [MQTT-3.14.2-4] [MQTT-3.4.2-3] [MQTT-3.5.2-3]
+	// [MQTT-3.6.2-3] [MQTT-3.9.2-2] [MQTT-3.11.2-2] [MQTT-3.15.2-3]
+	if user && !mods.DisallowProblemInfo && p.canEncode(pkt, PropUser) {
 		for _, v := range p.User {
-			pb.WriteByte(PropUser)
-			pb.Write(encodeString(v.Key))
-			pb.Write(encodeString(v.Val))
-		}
-		// [MQTT-3.2.2-20] [MQTT-3.14.2-4] [MQTT-3.4.2-3] [MQTT-3.5.2-3]
-		// [MQTT-3.6.2-3] [MQTT-3.9.2-2] [MQTT-3.11.2-2] [MQTT-3.15.2-3]
-		if mods.MaxSize == 0 || uint32(n+pb.Len()+1) < mods.MaxSize {
-			buf.Write(pb.Bytes())
+			buf.WriteByte(PropUser)
+			buf.Write(encodeString(v.Key))
+			buf.Write(encodeString(v.Val))
 		}
 	}
 
@@ -358,8 +392,6 @@ func (p *Properties) Encode(pkt byte, mods Mods, b *bytes.Buffer, n int) {
 		buf.WriteByte(p.SharedSubAvailable)
 	}
 
-	encodeLength(b, int64(buf.Len()))
-	b.Write(buf.Bytes()) // [MQTT-3.1.3-10]
 }
 
 // Decode decodes property bytes into a properties struct.
