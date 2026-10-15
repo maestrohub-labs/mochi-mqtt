@@ -206,6 +206,10 @@ func (p *Properties) canEncode(pkt byte, k byte) bool {
 // types). Upstream compared only n and the property against the limit, so a
 // packet a few bytes over it kept the property and could not be sent at all.
 // The Reason String is kept in preference to the User Properties.
+//
+// A PUBLISH is never altered: its User Properties belong to the message and
+// reach the receiver unchanged ([MQTT-3.3.2-17]). A PUBLISH too large for
+// the client is discarded whole by the caller ([MQTT-3.1.2-25]).
 func (p *Properties) Encode(pkt byte, mods Mods, b *bytes.Buffer, n int) {
 	if p == nil {
 		return
@@ -216,7 +220,7 @@ func (p *Properties) Encode(pkt byte, mods Mods, b *bytes.Buffer, n int) {
 	for _, keep := range [...]struct{ reason, user bool }{{true, true}, {true, false}, {false, true}, {false, false}} {
 		buf.Reset()
 		p.encode(pkt, mods, buf, keep.reason, keep.user)
-		if mods.MaxSize == 0 || packetSize(n, buf.Len()) <= int(mods.MaxSize) {
+		if pkt == Publish || mods.MaxSize == 0 || packetSize(n, buf.Len()) <= int(mods.MaxSize) {
 			break
 		}
 	}
@@ -364,7 +368,10 @@ func (p *Properties) encode(pkt byte, mods Mods, buf *bytes.Buffer, reason, user
 
 	// [MQTT-3.2.2-20] [MQTT-3.14.2-4] [MQTT-3.4.2-3] [MQTT-3.5.2-3]
 	// [MQTT-3.6.2-3] [MQTT-3.9.2-2] [MQTT-3.11.2-2] [MQTT-3.15.2-3]
-	if user && !mods.DisallowProblemInfo && p.canEncode(pkt, PropUser) {
+	// Request Problem Information 0 (DisallowProblemInfo) does not reach a
+	// PUBLISH's User Properties: [MQTT-3.1.2-29] exempts PUBLISH, whose
+	// properties are the message's own.
+	if user && (pkt == Publish || !mods.DisallowProblemInfo) && p.canEncode(pkt, PropUser) {
 		for _, v := range p.User {
 			buf.WriteByte(PropUser)
 			buf.Write(encodeString(v.Key))
