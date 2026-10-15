@@ -24,13 +24,24 @@ package mqtt
 // them all; a resend after that is answered at once. Nothing moves between
 // connections, so nothing needs to know which connection holds the session.
 //
+// Receive quota: a connection's first reservation for an id takes one unit
+// of its quota, returned at PUBREL; a further resend on the same connection
+// takes none (one PUBREL ends the flow there).
+//
 // An entry ends at PUBREL, with a refusal (the flow ends; a resend is a new
-// attempt), or with the session. A PUBLISH reusing a registered id without
-// the DUP flag is a new message (the client restarted its packet ids): its
-// entry replaces the old one. Entries are bounded per session by the
-// server's Receive Maximum: each holds receive quota until PUBCOMP.
+// attempt), when its PUBLISH is dropped before being handled (waiting
+// resends are settled with the drop's verdict), or with the session. A
+// PUBLISH reusing a registered id without the DUP flag is a new message
+// (the client restarted its packet ids): its entry replaces the old one.
+// While the client follows the protocol an entry per open QoS 2 flow
+// exists, so at most the Receive Maximum per session; an id whose PUBREL
+// never comes (a client that gave up on it) stays until its session ends,
+// at most one per packet id (65,536 per session).
+//
+// Sharded by client id: sessions never contend with each other.
 
 import (
+	"hash/maphash"
 	"sync"
 
 	"github.com/maestrohub-labs/mochi-mqtt/v2/packets"
@@ -49,29 +60,46 @@ type qos2Entry struct {
 	settled bool
 	reason  packets.Code
 	waiters []qos2Waiter
+	// reserved are the connections that hold a reservation (and a unit
+	// of receive quota) for the id.
+	reserved map[*Client]struct{}
+}
+
+const qos2Shards = 64
+
+type qos2Shard struct {
+	mu sync.Mutex
+	m  map[string]map[uint16]*qos2Entry
 }
 
 // qos2Registry is the server's per-session QoS 2 memory. The zero value is
 // ready to use.
 type qos2Registry struct {
-	mu sync.Mutex
-	m  map[string]map[uint16]*qos2Entry
+	seedOnce sync.Once
+	seed     maphash.Seed
+	shards   [qos2Shards]qos2Shard
+}
+
+func (r *qos2Registry) shard(clientID string) *qos2Shard {
+	r.seedOnce.Do(func() { r.seed = maphash.MakeSeed() })
+	return &r.shards[maphash.String(r.seed, clientID)%qos2Shards]
 }
 
 // claim registers a QoS 2 PUBLISH before it is handled. A resend (DUP) of
 // a registered id returns that entry and resent=true: it is not handled
-// again, and the caller adds its PUBREC as a waiter. Anything else gets a
-// new entry (replacing a stale one on a DUP 0 reuse of the id).
+// again; the caller adds its PUBREC with wait. Anything else gets a new
+// entry (replacing a stale one on a DUP 0 reuse of the id).
 func (r *qos2Registry) claim(clientID string, id uint16, dup bool) (e *qos2Entry, resent bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.m == nil {
-		r.m = map[string]map[uint16]*qos2Entry{}
+	sh := r.shard(clientID)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if sh.m == nil {
+		sh.m = map[string]map[uint16]*qos2Entry{}
 	}
-	ids := r.m[clientID]
+	ids := sh.m[clientID]
 	if ids == nil {
 		ids = map[uint16]*qos2Entry{}
-		r.m[clientID] = ids
+		sh.m[clientID] = ids
 	}
 	if old, ok := ids[id]; ok && dup {
 		return old, true
@@ -81,85 +109,133 @@ func (r *qos2Registry) claim(clientID string, id uint16, dup bool) (e *qos2Entry
 	return e, false
 }
 
+// firstReservation reports whether cl holds no reservation for e yet (and
+// records that it now does): only then does a reservation take receive
+// quota.
+func (r *qos2Registry) firstReservation(clientID string, e *qos2Entry, cl *Client) bool {
+	sh := r.shard(clientID)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if _, ok := e.reserved[cl]; ok {
+		return false
+	}
+	if e.reserved == nil {
+		e.reserved = map[*Client]struct{}{}
+	}
+	e.reserved[cl] = struct{}{}
+	return true
+}
+
 // wait adds w to e: settled now (with e's verdict) if e is, else when e
 // is.
-func (r *qos2Registry) wait(e *qos2Entry, w qos2Waiter) {
-	r.mu.Lock()
+func (r *qos2Registry) wait(clientID string, e *qos2Entry, w qos2Waiter) {
+	sh := r.shard(clientID)
+	sh.mu.Lock()
 	if !e.settled {
 		e.waiters = append(e.waiters, w)
-		r.mu.Unlock()
+		sh.mu.Unlock()
 		return
 	}
 	reason := e.reason
-	r.mu.Unlock()
+	sh.mu.Unlock()
 	w.cl.State.acks.settle(w.cl, w.p, reason, false)
 }
 
 // settle records e's verdict and settles every waiting PUBREC with it. A
 // refusal ends the flow: the entry is dropped (a resend is handled anew).
-// onReader is the caller's (see PublishSettlement.release): it applies to
-// the waiter on the releasing reader's own connection only.
+// reader, when set, is the connection whose own reader is releasing: it may
+// write its acks itself (see PublishSettlement.release).
 func (r *qos2Registry) settle(clientID string, id uint16, e *qos2Entry, reason packets.Code, reader *Client) {
-	r.mu.Lock()
+	r.finish(clientID, id, e, reason, reader, reason.Code >= packets.ErrUnspecifiedError.Code)
+}
+
+// abandon ends e when its PUBLISH was dropped before being handled (a hook
+// refused it in OnPublish, or lowered its QoS): resends already waiting on
+// it are settled with that verdict — never left waiting, which would hold
+// every later ack of their connection — and the entry is dropped.
+func (r *qos2Registry) abandon(clientID string, id uint16, e *qos2Entry, reason packets.Code) {
+	r.finish(clientID, id, e, reason, nil, true)
+}
+
+func (r *qos2Registry) finish(clientID string, id uint16, e *qos2Entry, reason packets.Code, reader *Client, drop bool) {
+	sh := r.shard(clientID)
+	sh.mu.Lock()
 	e.settled, e.reason = true, reason
 	waiters := e.waiters
 	e.waiters = nil
-	if reason.Code >= packets.ErrUnspecifiedError.Code {
-		r.forgetLocked(clientID, id, e)
+	if drop {
+		sh.forgetLocked(clientID, id, e)
 	}
-	r.mu.Unlock()
+	sh.mu.Unlock()
 	for _, w := range waiters {
 		w.cl.State.acks.settle(w.cl, w.p, reason, reader != nil && w.cl == reader)
 	}
 }
 
-// forget drops e (registered under clientID and id) if it is still the
-// registered one: its PUBLISH was dropped before being handled, or the id
-// was released (PUBREL).
-func (r *qos2Registry) forget(clientID string, id uint16, e *qos2Entry) {
-	r.mu.Lock()
-	r.forgetLocked(clientID, id, e)
-	r.mu.Unlock()
+// verdict is the settled verdict of a registered id (ok false: none known
+// yet, or not registered) — the answer to a PUBLISH resent after its PUBREC
+// was written.
+func (r *qos2Registry) verdict(clientID string, id uint16) (reason packets.Code, ok bool) {
+	sh := r.shard(clientID)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	if e := sh.m[clientID][id]; e != nil && e.settled {
+		return e.reason, true
+	}
+	return packets.Code{}, false
+}
+
+// holds reports whether e is still the entry registered for the id.
+func (r *qos2Registry) holds(clientID string, id uint16, e *qos2Entry) bool {
+	sh := r.shard(clientID)
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	return sh.m[clientID][id] == e
 }
 
 // release drops the entry of a released id (PUBREL), whatever it is.
 func (r *qos2Registry) release(clientID string, id uint16) {
-	r.mu.Lock()
-	if ids := r.m[clientID]; ids != nil {
+	sh := r.shard(clientID)
+	sh.mu.Lock()
+	if ids := sh.m[clientID]; ids != nil {
 		delete(ids, id)
 		if len(ids) == 0 {
-			delete(r.m, clientID)
+			delete(sh.m, clientID)
 		}
 	}
-	r.mu.Unlock()
+	sh.mu.Unlock()
 }
 
-func (r *qos2Registry) forgetLocked(clientID string, id uint16, e *qos2Entry) {
-	ids := r.m[clientID]
+func (sh *qos2Shard) forgetLocked(clientID string, id uint16, e *qos2Entry) {
+	ids := sh.m[clientID]
 	if ids == nil || ids[id] != e {
 		return
 	}
 	delete(ids, id)
 	if len(ids) == 0 {
-		delete(r.m, clientID)
+		delete(sh.m, clientID)
 	}
 }
 
 // endSession drops every entry of a session that ended (clean start,
 // expiry): its packet ids mean nothing any more.
 func (r *qos2Registry) endSession(clientID string) {
-	r.mu.Lock()
-	delete(r.m, clientID)
-	r.mu.Unlock()
+	sh := r.shard(clientID)
+	sh.mu.Lock()
+	delete(sh.m, clientID)
+	sh.mu.Unlock()
 }
 
 // size is the number of registered ids (tests).
 func (r *qos2Registry) size() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	n := 0
-	for _, ids := range r.m {
-		n += len(ids)
+	for i := range r.shards {
+		sh := &r.shards[i]
+		sh.mu.Lock()
+		for _, ids := range sh.m {
+			n += len(ids)
+		}
+		sh.mu.Unlock()
 	}
 	return n
 }

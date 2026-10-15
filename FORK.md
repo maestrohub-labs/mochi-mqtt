@@ -445,13 +445,28 @@ reaching an MQTT 5 client. Mutation: disabling the deferral makes
   per resend — each reserved in the queue of the connection its copy arrived
   on, in that connection's arrival order, and bound to it for life. Settling
   the first copy settles them all; a resend after that is answered at once.
-  The entry is registered before `OnPublish`, ends at PUBREL, on a refusal
-  (the flow ends) or with the session, and a PUBLISH reusing a registered id
-  without DUP is a new message (its entry replaces the old). Bounded per
-  session by the Receive Maximum.
-- `PublishSettlement.Done` follows the session for a QoS 2 publish: once a
-  takeover moved the session to another live connection, the verdict still
-  reaches the client, so `Done` is that connection's.
+  The entry is registered before `OnPublish` (after the topic alias, which a
+  resend may establish), ends at PUBREL (also when answered 0x92), on a
+  refusal (the flow ends), when its PUBLISH is dropped or downgraded in
+  `OnPublish` (resends already waiting get that verdict), or with the session;
+  a PUBLISH reusing a registered id without DUP is a new message (its entry
+  replaces the old). Receive quota is taken once per connection for an id: a
+  resend on the connection that already holds it takes none. While the client
+  follows the protocol there is an entry per open QoS 2 flow (at most the
+  Receive Maximum); an id whose PUBREL never comes stays until the session
+  ends — at most one per packet id, 65,536 per session. Sharded by client id
+  (64 shards): sessions never contend.
+- A PUBLISH resent after its PUBREC was written is answered with its stored
+  verdict (upstream answered 0x91 "packet identifier in use", which an MQTT 5
+  client reads as a failure of a stored message), and an MQTT 5 QoS 2 PUBLISH
+  refused with a reason code in `OnPublish` gets a PUBREC (upstream wrote a
+  PUBACK).
+- `PublishSettlement.Done` follows the session for a QoS 2 publish while its
+  id is registered: once a takeover moved the session to another connection,
+  `Done` is that connection's; in the moment between the old connection's
+  disconnect and the new one's registration it reports "not done" (ask
+  again) — the old client is marked taken over before it is disconnected.
+  A clean-start takeover ends the id, and `Done` is the old connection's.
 
 **Design note (rule 27).** A first version moved held PUBRECs between
 connections at takeover (`adopt`) and swapped each ack's owner; the review
@@ -468,6 +483,17 @@ connection's reader sits between reading the PUBLISH and that point is
 handled a second time. A refused PUBREC (a hook's failure code) ends the
 flow; a later resend is a new attempt.
 
+**Second review (bcaa56b → this).** R1 a same-connection resend took receive
+quota twice (an MQTT 3 client was disconnected after nine exchanges); R2 a
+resend waiting on a copy then dropped in `OnPublish` was never settled and
+held every later ack of its connection; R3 a resend returned before its topic
+alias was registered; R4 a 0x92 PUBREL left the id registered; R5 `Done`
+during the takeover window; R6 one registry lock for all sessions; plus the
+two upstream answers above. All fixed; the reviewer's reproductions are kept
+as `acks_qos2_review_test.go`. Not covered by a test: the order of the
+taken-over mark and the disconnect inside `inheritClientSession` (the window
+cannot be observed from outside); the "not done" answer it enables is.
+
 **Tests.** `acks_nonblocking_test.go`: a release does not block on a client
 that does not read (unread `net.Pipe`), and the acks arrive in order once it
 reads; a refusal does not overtake acks being written (with a watchdog);
@@ -476,8 +502,16 @@ nothing is written after an MQTT 3 refusal closed the sequencer.
 settled but unwritten, after a takeover, after a takeover of a settled
 publish, after two takeovers; a DUP 0 reuse of an id is handled; a release
 racing the takeover always answers the resend (200 iterations); PUBREL and a
-session end free the registry; `Done` follows the session. Mutation: each of
-seven fixes, reverted, fails at least one of them. `-race -count=5` clean
+session end free the registry; `Done` follows the session.
+`acks_qos2_more_test.go`: a 0x92 PUBREL frees the id; an ack for a closed
+connection leaves its inflight store alone; a clean takeover, the expiry
+sweep and a session ending with its connection (end to end) free the ids;
+`Done` is not done while the session moves; a QoS 2 refusal in `OnPublish`
+is a PUBREC; a resend after the PUBREC was written gets its verdict.
+`acks_qos2_review_test.go`: the second review's reproductions (quota leak,
+stranded waiter, topic alias, the old reader after a takeover, an MQTT 3
+refusal withholding later acks, a release/takeover/PUBREL stress). Mutation: each of
+the eighteen fixes that can be observed, reverted, fails at least one test. `-race -count=5` clean
 (`TestServerAddListenersFromConfig` fails on `mh-stable` too, unrelated).
 
 ## Upstream sync

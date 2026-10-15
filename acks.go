@@ -95,13 +95,22 @@ func (s *PublishSettlement) Done() <-chan struct{} {
 	if !s.Withholds() || s.cl.State.open == nil {
 		return nil
 	}
-	if s.qos2 != nil && s.cl.Closed() && s.srv != nil {
-		if c, ok := s.srv.Clients.Get(s.cl.ID); ok && c != s.cl && !c.Closed() && c.State.open != nil {
-			return c.State.open.Done()
+	if s.qos2 != nil && s.cl.Closed() && s.srv != nil && s.srv.qos2.holds(s.cl.ID, s.id, s.qos2) {
+		c, ok := s.srv.Clients.Get(s.cl.ID)
+		switch {
+		case ok && c != s.cl && c.State.open != nil:
+			return c.State.open.Done() // the connection that holds the session now
+		case ok && c == s.cl && s.cl.IsTakenOver():
+			// Taken over, the new connection not registered yet: the
+			// session is moving, not ended. Ask again.
+			return notDone
 		}
 	}
 	return s.cl.State.open.Done()
 }
+
+// notDone is never closed: "not gone yet" for a caller that asks Done again.
+var notDone = make(chan struct{})
 
 // release drops one hold. onReader: the caller is the client's own reader
 // (the server's hold, released at the end of processPublish), which may
