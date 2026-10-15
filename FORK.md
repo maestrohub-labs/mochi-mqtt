@@ -342,6 +342,68 @@ Also fixes a pre-existing flake in `TestServerProcessPublishACLCheckDeny`
 waiting for `processPublish`. `Stop` closes the conn, which ends the test's
 `ReadAll`, before it marks the client closed.
 
+### 9. Acknowledge a publish only after the hooks that handle it are done — `OnPublishedSettle` (v2.7.9-mh.9)
+
+**Upstream PR:** not yet filed. The fork contract above requires one; the
+change is a new opt-in hook, not MaestroHub-specific, and changes nothing for
+a server without a hook that provides `OnPublishedSettle`.
+
+**Problem.** `processPublish` wrote the QoS 1 PUBACK (QoS 2 PUBREC) before
+`OnPublished` ran. MaestroHub stores every value from a hook (handed to a
+worker pool), so the client was told "the broker has it" while the value was
+still only in memory: a crash in between lost values the client had
+discarded. Measured on MaestroHub Lite, kill -9 mid-stream: acknowledged values
+missing from the historian afterwards.
+
+**Fix.**
+
+- New hook `OnPublishedSettle(cl, pk, *PublishSettlement)`, called for every
+  publish right after `OnPublished`. A hook that must finish with a message
+  before it is acknowledged calls `s.Hold()` (before returning) and later the
+  returned `release(code)` exactly once, from any goroutine. QoS 0 and
+  inline-client publishes get a settlement whose `Hold` is a no-op, so a hook
+  treats every publish alike.
+- With such a hook present, the ack of a QoS 1/2 publish is reserved on the
+  client's `ackSequencer` (`acks.go`) by the reader, in arrival order, and
+  written once every hold is released. Settled acks leave strictly in arrival
+  order ([MQTT-4.6.0-2]); a settled prefix goes out in one write
+  (`writeAcks`), still subject to the read-burst coalescing of patch 8.
+  Refusal acks decided on arrival (not authorized, packet id in use, a reason
+  code from `OnPublish`) queue behind pending acks instead of overtaking them.
+  Each client has its own sequencer: one client's slow message never holds
+  another client's acks.
+- `release(code)` with a code ≥ 0x80: an MQTT 5 client gets it as the
+  PUBACK/PUBREC reason code; an MQTT 3 client (no reason codes) gets neither
+  that ack nor the ones behind it, and is disconnected so it sends them again.
+- Nothing enters the inflight store until its ack is written (a QoS 2 PUBREC
+  then does, to await PUBREL): a session resumed meanwhile never resends an
+  ack for a message that was not handled.
+- Receive quota returns when the ack is written. An MQTT 5 client that exceeds
+  its Receive Maximum is still disconnected (0x93). An MQTT 3 client, which
+  knows no Receive Maximum, is instead not read from until an ack returns
+  quota (TCP back-pressure).
+
+**API.** The `Hook` interface gains `OnPublishedSettle`; a hook that embeds
+`HookBase` (every hook here and in MaestroHub) needs no change. The
+constant is appended after `StoredSysInfo`, so no existing hook constant
+changes value. `PublishSettlement.Withholds()` says whether an ack waits
+(QoS 1/2 from a network client); `Done()` closes when that client goes away.
+
+**Trade-off.** One client's acks wait for its slowest pending message, so a
+client's in-flight window (and the server's Receive Maximum) bounds its
+throughput by the handler's latency, as on any broker that acknowledges after
+storing. A QoS 2 PUBLISH resent while its first copy is still being handled is
+handled twice (there is no inflight entry yet to recognise it).
+
+**Tests.** `acks_test.go`: ack waits for release; arrival order with
+out-of-order releases; settled prefix in one write; refusal behind a pending
+ack; MQTT 5 reason code; MQTT 3 disconnect without acks; QoS 0 no-op; QoS 2
+PUBREC → inflight → PUBCOMP; other clients not held back; MQTT 3
+back-pressure; MQTT 5 still disconnected past Receive Maximum; no hook →
+immediate ack; a second release ignored; `Withholds`/`Done`; a refusal code
+reaching an MQTT 5 client. Mutation: disabling the deferral makes
+10 of them fail.
+
 ## Upstream sync
 
 ```sh
