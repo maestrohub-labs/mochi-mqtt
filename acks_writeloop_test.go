@@ -5,6 +5,7 @@
 package mqtt
 
 import (
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -48,6 +49,9 @@ func TestSettledAcksAfterCloseLeaveTheSequencerIdle(t *testing.T) {
 	require.NoError(t, s.processPacket(cl, publishQos(1, 1)))
 	require.NoError(t, s.processPacket(cl, publishQos(2, 1)))
 	h.release(t, 1, packets.CodeSuccess) // handed over, WriteLoop not running
+	// Take the wake-up, so the WriteLoop below can only see the close: the
+	// close branch alone must leave the sequencer idle.
+	<-cl.State.acks.wake
 	cl.Stop(packets.ErrSessionTakenOver)
 	done := make(chan struct{})
 	go func() { cl.WriteLoop(); close(done) }() // sees the close, drains, exits
@@ -74,4 +78,60 @@ func TestSettledAckIsNotHeldForABusyReader(t *testing.T) {
 	cl.State.readAhead.Store(true) // the reader is mid-burst, busy in a handler
 	h.release(t, 1, packets.CodeSuccess)
 	expectAck(t, wire, packets.Puback, 1)
+}
+
+// An ack that cannot be written on an open connection — here a refusal
+// whose reason code makes the PUBACK larger than the client's Maximum
+// Packet Size (the encoder drops a reason string to fit, never the code;
+// a write that times out on a slow client is the other way) — returns no receive quota and completes no flow, and ends
+// the connection: the acks behind it must not overtake it, so the client
+// resends what was not acknowledged. The ack before it still goes out.
+// (mh.9–mh.11 counted every ack of the run as written.)
+func TestAckThatCannotBeWrittenIsNotCountedAndEndsTheConnection(t *testing.T) {
+	s, h := newSettleServer(t)
+	cl, r, _ := newTestClient()
+	cl.Properties.ProtocolVersion = 5
+	cl.Properties.Props.MaximumPacketSize = 4      // a bare PUBACK (4 bytes) fits, one with a reason code does not
+	cl.ops.options.ClientNetWriteBufferSize = 2048 // the server default: the run is buffered, then written once
+	wire := readWire(r)
+
+	for id := uint16(1); id <= 3; id++ {
+		require.NoError(t, s.processPacket(cl, publishQos(id, 1)))
+	}
+	require.Equal(t, int32(7), atomic.LoadInt32(&cl.State.Inflight.receiveQuota))
+
+	// 2 (refused) and 3 settle first and wait for 1; then 1 settles and the
+	// three go out as one run: 1 is written, 2 cannot be, 3 must not be.
+	h.release(t, 2, packets.ErrUnspecifiedError)
+	h.release(t, 3, packets.CodeSuccess)
+	h.release(t, 1, packets.CodeSuccess)
+	expectAck(t, wire, packets.Puback, 1)
+	require.Eventually(t, cl.Closed, time.Second, time.Millisecond, "an ack that cannot be written ends the connection")
+	for p := range wire {
+		t.Fatalf("written after the ack that could not be: %+v", p)
+	}
+	require.Equal(t, int32(8), atomic.LoadInt32(&cl.State.Inflight.receiveQuota), "quota returned for acks never sent")
+	require.False(t, cl.State.acks.busy())
+}
+
+// An ack held in the write buffer because a publish was queued for
+// WriteLoop (writePacket holds while outbound is not empty) is flushed
+// even when that publish then fails before it is written.
+func TestAckHeldBehindAQueuedPublishThatFailsIsFlushed(t *testing.T) {
+	cl, r, _ := newTestClientNoWriteLoop()
+	cl.ops.options.ClientNetWriteBufferSize = 2048 // the server default (Options.ensureDefaults)
+	cl.Properties.Props.MaximumPacketSize = 64
+	wire := readWire(r)
+
+	big := *packets.TPacketData[packets.Publish].Get(packets.TPublishQos1).Packet
+	big.Payload = make([]byte, 256) // too large for the client: never written
+	cl.State.outbound <- &big
+	atomic.AddInt32(&cl.State.outboundQty, 1)
+
+	ack := packets.Packet{FixedHeader: packets.FixedHeader{Type: packets.Puback}, PacketID: 9}
+	require.NoError(t, cl.WritePacket(ack)) // held: the queued publish is to flush it
+	expectNone(t, wire)
+
+	go cl.WriteLoop()
+	expectAck(t, wire, packets.Puback, 9)
 }
