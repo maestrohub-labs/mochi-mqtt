@@ -160,6 +160,7 @@ type Server struct {
 	hooks        *Hooks               // hooks contains hooks for extra functionality such as auth and persistent storage
 	inlineClient *Client              // inlineClient is a special client used for inline subscriptions and inline Publish
 	conns        connections          // every network connection being served, registered or not
+	qos2         qos2Registry         // MAESTROHUB PATCH: QoS 2 ids received and not yet released, per session (acks_qos2.go)
 }
 
 // connections tracks every network connection from the moment attachClient
@@ -584,7 +585,8 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 	if expire && !cl.IsTakenOver() {
 		cl.ClearInflights()
 		s.UnsubscribeClient(cl)
-		s.Clients.Delete(cl.ID) // [MQTT-4.1.0-2] ![MQTT-3.1.2-23]
+		s.Clients.Delete(cl.ID)  // [MQTT-4.1.0-2] ![MQTT-3.1.2-23]
+		s.qos2.endSession(cl.ID) // MAESTROHUB PATCH (acks_qos2.go)
 	}
 
 	return err
@@ -661,14 +663,12 @@ func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
 		if pk.Connect.Clean || (existing.Properties.Clean && existing.Properties.ProtocolVersion < 5) { // [MQTT-3.1.2-4] [MQTT-3.1.4-4]
 			s.UnsubscribeClient(existing)
 			existing.ClearInflights()
+			s.qos2.endSession(existing.ID)         // MAESTROHUB PATCH (acks_qos2.go)
 			existing.State.isTakenOver.Store(true) // only set isTakenOver after unsubscribe has occurred
 			return false                           // [MQTT-3.2.2-3]
 		}
 
 		existing.State.isTakenOver.Store(true)
-		// MAESTROHUB PATCH: QoS 2 PUBRECs still held on the old
-		// connection belong to the session, not the connection.
-		cl.State.acks.adopt(cl, &existing.State.acks)
 		if existing.State.Inflight.Len() > 0 {
 			cl.State.Inflight = existing.State.Inflight.Clone() // [MQTT-3.1.2-5]
 			if cl.State.Inflight.maximumReceiveQuota == 0 && cl.ops.options.Capabilities.ReceiveMaximum != 0 {
@@ -1028,10 +1028,25 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 	}
 
 	// MAESTROHUB PATCH: a QoS 2 PUBLISH resent while its first copy's
-	// PUBREC is still held (not yet in the inflight store) is answered by
-	// that PUBREC, not handled again (exactly once).
-	if !cl.Net.Inline && pk.FixedHeader.Qos == 2 && cl.State.acks.resumePubrec(cl, pk.PacketID) {
-		return nil
+	// PUBREC is held (acks_qos2.go) is answered by that copy's verdict,
+	// not handled again: its PUBREC is queued here, in this connection's
+	// arrival order. Registered before OnPublish, so a copy still in the
+	// hooks on an old connection is already known to the new one.
+	var qos2 *qos2Entry
+	if !cl.Net.Inline && pk.FixedHeader.Qos == 2 && s.Options.Capabilities.MaximumQos >= 2 && s.hooks.Provides(OnPublishedSettle) {
+		e, resent := s.qos2.claim(cl.ID, pk.PacketID, pk.FixedHeader.Dup)
+		if resent {
+			cl.State.Inflight.DecreaseReceiveQuota() // as for the copy it stands for, until PUBCOMP
+			ack := s.buildAck(pk.PacketID, packets.Pubrec, 0, pk.Properties, packets.CodeSuccess)
+			s.qos2.wait(e, qos2Waiter{cl: cl, p: cl.State.acks.reserve(ack)})
+			return nil
+		}
+		qos2 = e
+		defer func() {
+			if qos2 != nil { // dropped before it was handled: a resend is new
+				s.qos2.forget(cl.ID, pk.PacketID, qos2)
+			}
+		}()
 	}
 
 	if pk.Properties.TopicAliasFlag && pk.Properties.TopicAlias > 0 { // [MQTT-3.3.2-11]
@@ -1083,7 +1098,12 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 	// is put in the inflight store until the ack is written, so a session
 	// resumed meanwhile never resends an ack for a message not handled.
 	if s.hooks.Provides(OnPublishedSettle) {
-		settlement := &PublishSettlement{cl: cl, ack: cl.State.acks.reserve(cl, ack)}
+		settlement := &PublishSettlement{cl: cl, ack: cl.State.acks.reserve(ack)}
+		if qos2 != nil && pk.FixedHeader.Qos == 2 {
+			settlement.srv, settlement.qos2, settlement.id = s, qos2, pk.PacketID
+			s.qos2.wait(qos2, qos2Waiter{cl: cl, p: settlement.ack})
+			qos2 = nil // handled: the entry lives until PUBREL
+		}
 		settlement.holds.Store(1) // the server's own, released below
 		s.publishToSubscribers(pk)
 		s.hooks.OnPublished(cl, pk)
@@ -1361,6 +1381,8 @@ func (s *Server) processPubrel(cl *Client, pk packets.Packet) error {
 		cl.ops.hooks.OnQosDropped(cl, pk)
 		return nil
 	}
+
+	s.qos2.release(cl.ID, pk.PacketID) // MAESTROHUB PATCH: the id is free again (acks_qos2.go)
 
 	ack := s.buildAck(pk.PacketID, packets.Pubcomp, 0, pk.Properties, packets.CodeSuccess) // [MQTT-4.3.3-11]
 	cl.State.Inflight.Set(ack)
@@ -1900,7 +1922,8 @@ func (s *Server) clearExpiredClients(dt int64) {
 
 		if disconnected+int64(expire) < dt {
 			s.hooks.OnClientExpired(client)
-			s.Clients.Delete(id) // [MQTT-4.1.0-2]
+			s.Clients.Delete(id)  // [MQTT-4.1.0-2]
+			s.qos2.endSession(id) // MAESTROHUB PATCH (acks_qos2.go)
 		}
 	}
 }

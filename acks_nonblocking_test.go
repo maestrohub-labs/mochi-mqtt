@@ -55,12 +55,49 @@ func TestRefusalDoesNotOvertakeAcksBeingWritten(t *testing.T) {
 	cl.Properties.ProtocolVersion = 5
 
 	require.NoError(t, s.processPacket(cl, publishQos(1, 1)))
-	h.release(t, 1, packets.CodeSuccess) // settled; its write blocks (nobody reads yet)
-	refused := publishQos(2, 1)
-	require.NoError(t, cl.State.acks.writeNowOrQueue(cl, s.buildAck(refused.PacketID, packets.Puback, 0, refused.Properties, packets.ErrNotAuthorized)))
+	// A regression writes on these goroutines and blocks (nobody reads
+	// yet): fail fast instead of hanging the package.
+	queued := make(chan error, 1)
+	go func() {
+		h.release(t, 1, packets.CodeSuccess) // settled; its write blocks (nobody reads yet)
+		refused := publishQos(2, 1)
+		queued <- cl.State.acks.writeNowOrQueue(cl, s.buildAck(refused.PacketID, packets.Puback, 0, refused.Properties, packets.ErrNotAuthorized))
+	}()
+	select {
+	case err := <-queued:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("releasing or queueing a refusal blocked on a client that does not read")
+	}
 
 	wire := readWire(r)
 	expectAck(t, wire, packets.Puback, 1)
 	p := expectAck(t, wire, packets.Puback, 2)
 	require.Equal(t, packets.ErrNotAuthorized.Code, p.reason)
+}
+
+// After a refusal an MQTT 3 client cannot be told has ended the connection,
+// no later ack is written — not even in the moment before the connection is
+// actually stopped ([MQTT-4.6.0-2]: no PUBACK for N+1 without N).
+func TestNoAckAfterMqtt3RefusalClosedTheSequencer(t *testing.T) {
+	cl, _, _ := newTestClient()
+	cl.Net.Conn = nil
+	cl.Properties.ProtocolVersion = 4
+	q := &cl.State.acks
+	refused := q.reserve(publishQos(1, 1))
+	refused.settled, refused.reason = true, packets.ErrUnspecifiedError
+	q.mu.Lock()
+	q.flushSettledLocked(cl)
+	ready := q.ready
+	q.ready = nil
+	q.mu.Unlock()
+	require.True(t, q.write(cl, ready), "the refusal ends the connection")
+
+	// A publish the reader took in before the connection was stopped.
+	later := q.reserve(publishQos(2, 1))
+	q.settle(cl, later, packets.CodeSuccess, false)
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	require.Empty(t, q.ready, "an ack was queued for writing after the refusal")
+	require.False(t, q.writing, "a writer started after the refusal")
 }

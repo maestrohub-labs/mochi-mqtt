@@ -44,6 +44,11 @@ type PublishSettlement struct {
 	cl    *Client
 	ack   *pendingAck // nil: nothing to acknowledge
 	holds atomic.Int32
+	// QoS 2 only: the session's registry entry for the packet id, which
+	// settles this PUBREC and every resend's (acks_qos2.go).
+	srv  *Server
+	qos2 *qos2Entry
+	id   uint16
 	// failed is the first refusal a release reported (nil: none).
 	failed atomic.Pointer[packets.Code]
 }
@@ -80,12 +85,20 @@ func (s *PublishSettlement) Withholds() bool {
 	return s != nil && s.ack != nil
 }
 
-// Done is closed when the client the publish came from is gone: an
-// acknowledgement could no longer reach it. Nil (never closed) when the
-// settlement withholds nothing.
+// Done is closed when no connection can be told the verdict any more:
+// the client the publish came from is gone. For a QoS 2 publish whose
+// session another connection has resumed, the verdict still reaches the
+// client (a resend of it waits for it, acks_qos2.go), so Done is then
+// that connection's. Call it again for a fresh answer after it fires.
+// Nil (never closed) when the settlement withholds nothing.
 func (s *PublishSettlement) Done() <-chan struct{} {
 	if !s.Withholds() || s.cl.State.open == nil {
 		return nil
+	}
+	if s.qos2 != nil && s.cl.Closed() && s.srv != nil {
+		if c, ok := s.srv.Clients.Get(s.cl.ID); ok && c != s.cl && !c.Closed() && c.State.open != nil {
+			return c.State.open.Done()
+		}
 	}
 	return s.cl.State.open.Done()
 }
@@ -105,26 +118,20 @@ func (s *PublishSettlement) release(code packets.Code, onReader bool) {
 	if f := s.failed.Load(); f != nil {
 		reason = *f
 	}
-	// The ack's owner, not s.cl: a QoS 2 PUBREC moves with its session
-	// to the connection that resumed it (adopt). The reader shortcut
-	// holds only for the reader of the connection that owns it.
-	o := s.ack.owner.Load()
-	s.ack.owner.Load().q.settle(o.cl, s.ack, reason, onReader && o.cl == s.cl)
-}
-
-// ackOwner is the connection a pending ack is written to.
-type ackOwner struct {
-	q  *ackSequencer
-	cl *Client
+	if s.qos2 != nil {
+		var reader *Client
+		if onReader {
+			reader = s.cl
+		}
+		s.srv.qos2.settle(s.cl.ID, s.id, s.qos2, reason, reader)
+		return
+	}
+	s.cl.State.acks.settle(s.cl, s.ack, reason, onReader)
 }
 
 // pendingAck is one acknowledgement waiting for its turn.
 type pendingAck struct {
-	ack packets.Packet
-	// owner is where the ack is written: the client it arrived on, or the
-	// one that resumed its session (adopt). Moved only under both
-	// sequencers' locks.
-	owner   atomic.Pointer[ackOwner]
+	ack     packets.Packet
 	settled bool
 	reason  packets.Code // refusal (Code >= 0x80) or zero
 	// reserved: the ack of a publish that took receive quota and is
@@ -140,15 +147,15 @@ type pendingAck struct {
 type ackSequencer struct {
 	mu      sync.Mutex
 	pending []*pendingAck
-	// adopted are the QoS 2 PUBRECs of a session this client resumed
-	// that were not written on the old connection, by packet id: a resend
-	// of one is answered by it (resumePubrec), not handled again.
-	adopted map[uint16]*pendingAck
 	// ready are settled acks, in order, handed to the writer goroutine;
 	// writing is true while it runs (it writes ready, then exits once
 	// ready is empty).
 	ready   []*pendingAck
 	writing bool
+	// closed: a refusal an MQTT 3 client cannot be told ended the
+	// connection; no ack is written after it ([MQTT-4.6.0-2]: no PUBACK
+	// for a later publish without the earlier one's).
+	closed bool
 	// freed gets a token whenever an ack returned receive quota; the
 	// reader waits on it (waitForQuota).
 	freed chan struct{}
@@ -160,9 +167,8 @@ func (q *ackSequencer) init() {
 
 // reserve appends the ack of a publish being handled. Called by the
 // client's reader, so the queue order is the arrival order.
-func (q *ackSequencer) reserve(cl *Client, ack packets.Packet) *pendingAck {
+func (q *ackSequencer) reserve(ack packets.Packet) *pendingAck {
 	p := &pendingAck{ack: ack, reserved: true}
-	p.owner.Store(&ackOwner{q: q, cl: cl})
 	q.mu.Lock()
 	q.pending = append(q.pending, p)
 	q.mu.Unlock()
@@ -182,6 +188,10 @@ func (q *ackSequencer) busy() bool {
 // behind those. Called by the client's reader.
 func (q *ackSequencer) writeNowOrQueue(cl *Client, ack packets.Packet) error {
 	q.mu.Lock()
+	if q.closed {
+		q.mu.Unlock()
+		return nil
+	}
 	if len(q.pending) == 0 && len(q.ready) == 0 && !q.writing {
 		q.mu.Unlock()
 		return cl.WritePacket(ack)
@@ -206,7 +216,7 @@ func (q *ackSequencer) settle(cl *Client, p *pendingAck, reason packets.Code, on
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	p.settled, p.reason = true, reason
-	if !q.flushSettledLocked(cl) || q.writing {
+	if q.closed || !q.flushSettledLocked(cl) || q.writing {
 		return
 	}
 	q.writing = true
@@ -220,8 +230,7 @@ func (q *ackSequencer) settle(cl *Client, p *pendingAck, reason packets.Code, on
 }
 
 // flushSettledLocked moves the settled prefix of pending to ready and
-// reports whether there was one. From resumePubrec (not settle) it also
-// starts the writer, since nothing else will. Caller holds q.mu.
+// reports whether there was one. Caller holds q.mu.
 func (q *ackSequencer) flushSettledLocked(cl *Client) bool {
 	n := 0
 	for n < len(q.pending) && q.pending[n].settled {
@@ -243,7 +252,7 @@ func (q *ackSequencer) writeReady(cl *Client) {
 		q.mu.Lock()
 		ready := q.ready
 		q.ready = nil
-		if len(ready) == 0 {
+		if len(ready) == 0 || q.closed {
 			q.writing = false
 			q.mu.Unlock()
 			return
@@ -277,16 +286,20 @@ func (q *ackSequencer) write(cl *Client, ready []*pendingAck) (disconnected bool
 		reserved = append(reserved, r.reserved)
 	}
 	if disconnect {
+		// Closed under the lock: no settle after this writes anything,
+		// even before the Stop below has ended the connection.
 		q.mu.Lock()
-		q.pending, q.ready, q.writing = nil, nil, false
+		q.pending, q.ready, q.writing, q.closed = nil, nil, false, true
 		q.mu.Unlock()
 	}
 
 	if len(acks) > 0 {
 		_ = cl.writeAcks(acks) // a closed client: the acks go nowhere, the client resends
-		for i := range acks {
-			if reserved[i] {
-				cl.ackWritten(acks[i])
+		if !cl.Closed() {      // a dead connection's session state is not this client's any more
+			for i := range acks {
+				if reserved[i] {
+					cl.ackWritten(acks[i])
+				}
 			}
 		}
 		select {
@@ -298,68 +311,6 @@ func (q *ackSequencer) write(cl *Client, ready []*pendingAck) (disconnected bool
 		cl.Stop(packets.ErrUnspecifiedError)
 	}
 	return disconnect
-}
-
-// resumePubrec answers a QoS 2 PUBLISH resent while its first copy's
-// PUBREC is not written yet, instead of handling it again (exactly once).
-// The first copy is pending on this connection (a resend on the same
-// connection: its PUBREC will answer it), or was adopted from the session
-// this client resumed: it then joins this connection's queue in arrival
-// order and is written here when its handler settles it — at once if it
-// has. Reports whether the PUBLISH was such a resend. Called by the
-// reader.
-func (q *ackSequencer) resumePubrec(cl *Client, id uint16) bool {
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	for _, p := range q.pending {
-		if p.reserved && !p.settled && p.ack.FixedHeader.Type == packets.Pubrec && p.ack.PacketID == id {
-			return true
-		}
-	}
-	p, ok := q.adopted[id]
-	if !ok {
-		return false
-	}
-	delete(q.adopted, id)
-	cl.State.Inflight.DecreaseReceiveQuota() // as for any QoS 2 publish until PUBCOMP
-	q.pending = append(q.pending, p)
-	if q.flushSettledLocked(cl) && !q.writing {
-		q.writing = true
-		go q.writeReady(cl)
-	}
-	return true
-}
-
-// adopt moves the unwritten QoS 2 PUBRECs of a session's previous
-// connection to q (this client, resuming it): they are kept by packet id
-// until the client resends their PUBLISH (resumePubrec). Settled ones not
-// yet handed to the old connection's writer move too. Anything else stays
-// with the old connection, which is closing.
-func (q *ackSequencer) adopt(cl *Client, old *ackSequencer) {
-	if old == q {
-		return
-	}
-	old.mu.Lock()
-	defer old.mu.Unlock()
-	q.mu.Lock()
-	defer q.mu.Unlock()
-	keep := func(list []*pendingAck) []*pendingAck {
-		out := list[:0]
-		for _, p := range list {
-			if p.reserved && p.ack.FixedHeader.Type == packets.Pubrec {
-				if q.adopted == nil {
-					q.adopted = map[uint16]*pendingAck{}
-				}
-				p.owner.Store(&ackOwner{q: q, cl: cl})
-				q.adopted[p.ack.PacketID] = p
-				continue
-			}
-			out = append(out, p)
-		}
-		return out
-	}
-	old.pending = keep(old.pending)
-	old.ready = keep(old.ready)
 }
 
 // ackWritten does, for an ack the sequencer wrote, what processPublish does
