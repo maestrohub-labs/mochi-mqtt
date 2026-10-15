@@ -7,6 +7,7 @@ package packets
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -52,9 +53,6 @@ func TestOptionalPropertiesRespectTheWholePacketSize(t *testing.T) {
 		{"auth", func(p Properties) Packet {
 			return Packet{FixedHeader: FixedHeader{Type: Auth}, ProtocolVersion: 5, ReasonCode: CodeContinueAuthentication.Code, Properties: p}
 		}, true},
-		{"publish", func(p Properties) Packet {
-			return Packet{FixedHeader: FixedHeader{Type: Publish, Qos: 1}, ProtocolVersion: 5, PacketID: 7, TopicName: "a/b", Payload: []byte("hello"), Properties: p}
-		}, false},
 	}
 	encode := func(t *testing.T, pk Packet, max uint32) []byte {
 		t.Helper()
@@ -87,6 +85,7 @@ func TestOptionalPropertiesRespectTheWholePacketSize(t *testing.T) {
 		return buf.Bytes()
 	}
 
+	long := func(n int) string { return strings.Repeat("r", n) }
 	for _, k := range kinds {
 		for _, opt := range []struct {
 			name  string
@@ -95,6 +94,13 @@ func TestOptionalPropertiesRespectTheWholePacketSize(t *testing.T) {
 		}{
 			{"reason string", Properties{ReasonString: "abcdefghij"}, true},
 			{"user property", Properties{User: []UserProperty{{Key: "k", Val: "abcdefgh"}}}, false},
+			// The remaining length (and the property length) crosses a
+			// Variable Byte Integer boundary: 127 → 128 and 16383 → 16384,
+			// so the fixed header grows by a byte.
+			{"reason string 150", Properties{ReasonString: long(150)}, true},
+			{"reason string 16400", Properties{ReasonString: long(16400)}, true},
+			{"user property 150", Properties{User: []UserProperty{{Key: "k", Val: long(150)}}}, false},
+			{"user property 16400", Properties{User: []UserProperty{{Key: "k", Val: long(16400)}}}, false},
 		} {
 			if opt.only && !k.reasonString {
 				continue
@@ -103,7 +109,15 @@ func TestOptionalPropertiesRespectTheWholePacketSize(t *testing.T) {
 				bare := len(encode(t, k.build(Properties{}), 0))
 				full := len(encode(t, k.build(opt.props), 0))
 				require.Greater(t, full, bare)
-				for max := bare; max <= full+1; max++ {
+				var maxes []int
+				if full-bare <= 300 {
+					for max := bare; max <= full+1; max++ {
+						maxes = append(maxes, max)
+					}
+				} else {
+					maxes = []int{bare, bare + 1, bare + 2, bare + 3, full - 3, full - 2, full - 1, full, full + 1}
+				}
+				for _, max := range maxes {
 					got := encode(t, k.build(opt.props), uint32(max))
 					require.LessOrEqual(t, len(got), max, "max %d: the packet exceeds the client's maximum", max)
 					if max >= full {
@@ -115,6 +129,45 @@ func TestOptionalPropertiesRespectTheWholePacketSize(t *testing.T) {
 			})
 		}
 	}
+
+	// Both optional properties, room for one: the Reason String is kept
+	// (the User Properties here are smaller, so they alone would fit too).
+	for _, k := range kinds {
+		if !k.reasonString {
+			continue
+		}
+		t.Run(k.name+"/reason string kept before user properties", func(t *testing.T) {
+			both := Properties{ReasonString: "a reason string", User: []UserProperty{{Key: "k", Val: "v"}}}
+			reasonOnly := encode(t, k.build(Properties{ReasonString: both.ReasonString}), 0)
+			userOnly := encode(t, k.build(Properties{User: both.User}), 0)
+			require.Less(t, len(userOnly), len(reasonOnly))
+			got := encode(t, k.build(both), uint32(len(reasonOnly)))
+			require.Equal(t, reasonOnly, got)
+		})
+	}
+}
+
+// [MQTT-3.3.2-17] a PUBLISH's User Properties reach the receiver
+// unaltered, and [MQTT-3.1.2-29] exempts PUBLISH from Request Problem
+// Information: they are never left out. A PUBLISH too large for the client
+// is discarded whole ([MQTT-3.1.2-25]; writePacket: ErrPacketTooLarge,
+// fixture TPublishDropOversize), never sent stripped.
+func TestPublishUserPropertiesAreNeverStripped(t *testing.T) {
+	build := func(mods Mods) Packet {
+		mods.AllowResponseInfo = true
+		return Packet{FixedHeader: FixedHeader{Type: Publish, Qos: 1}, ProtocolVersion: 5, PacketID: 7, TopicName: "a/b", Payload: []byte("hello"),
+			Properties: Properties{CorrelationData: []byte(strings.Repeat("c", 200)), User: []UserProperty{{Key: "k", Val: "v"}}}, Mods: mods}
+	}
+	enc := func(pk Packet) []byte {
+		var buf bytes.Buffer
+		require.NoError(t, pk.PublishEncode(&buf))
+		return buf.Bytes()
+	}
+	full := enc(build(Mods{}))
+	for _, max := range []int{10, 100, len(full) - 10, len(full) - 1, len(full), len(full) + 1} {
+		require.Equal(t, full, enc(build(Mods{MaxSize: uint32(max)})), "max %d: the PUBLISH was altered", max)
+	}
+	require.Equal(t, full, enc(build(Mods{DisallowProblemInfo: true})), "Request Problem Information 0 stripped a PUBLISH's User Properties")
 }
 
 // The reviewer's case: an MQTT 5 refusal PUBACK with Reason String

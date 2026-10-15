@@ -624,7 +624,22 @@ a 24-byte packet for a maximum of 18, now expects the 15-byte packet.
 
 **Tests.** `packets/properties_maxsize_test.go`: every size from the bare
 packet to one past the full packet, for both properties and every packet
-type above (and PUBLISH's User Properties); the 15–19-byte PUBACK boundary.
+type above; the 15–19-byte PUBACK boundary; remaining lengths that cross
+the Variable Byte Integer boundaries (127, 16383); the Reason String kept
+before the User Properties when only one fits.
+
+**A PUBLISH is never altered (v2.7.9-mh.14).** mh.13 put PUBLISH through
+the same drop loop, so any PUBLISH too large for the client (big
+correlation data, say) went out with its User Properties stripped. They
+are the message's own and reach the receiver unaltered ([MQTT-3.3.2-17]);
+a PUBLISH too large for the client is discarded whole ([MQTT-3.1.2-25],
+`writePacket`: `ErrPacketTooLarge`, fixture `TPublishDropOversize`) — as
+upstream intends, which stripped them only when they alone were too big.
+Separately (upstream too), Request Problem Information 0
+(`DisallowProblemInfo`) stripped a PUBLISH's User Properties, though
+[MQTT-3.1.2-29] exempts PUBLISH; it no longer does. Tests:
+`TestPublishUserPropertiesAreNeverStripped` (packets),
+`TestOversizePublishIsDiscardedNotStripped`.
 
 ## Upstream sync
 
