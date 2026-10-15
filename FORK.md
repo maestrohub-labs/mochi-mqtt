@@ -480,12 +480,18 @@ reaching an MQTT 5 client. Mutation: disabling the deferral makes
   session's subscriptions from the topic index itself (`unsubscribeAll`):
   `UnsubscribeClient` skips the index for a client taken over, which is
   why upstream marked only after unsubscribing ([MQTT-3.1.2-4]).
-- The end of a session — a connection's own `attachClient` tail and the
-  expiry sweep — deletes the client id only while it still maps to that
-  client (`Clients.deleteIf`), and only then ends its QoS 2 ids: a new
-  connection that took the id since keeps its session. (Marking alone left
-  a check-then-act: an old connection failing on its own could still
-  delete the new client.)
+- A session's fate is decided once, by one compare-and-swap on the old
+  client (`claimTakeover` / `claimEnd`): taken over by a new connection, or
+  ended — by its connection's `attachClient` tail when it expires with it,
+  or by the expiry sweep. Whoever wins does all of it; the others do
+  nothing. The end (`endSessionOf`) clears the inflights, removes the
+  subscriptions from the topic index (upstream's sweep never did: the
+  index leaked, and the next clean session under that id was routed the
+  old filters), deletes the client id only while it still maps to that
+  client (`Clients.deleteIf`), and only then ends its QoS 2 ids. A
+  takeover that finds the session already ended inherits nothing. (The
+  fourth round's taken-over check followed by a delete was two steps a
+  takeover could interleave.)
 - `PublishSettlement.Done` follows the session for a QoS 2 publish while its
   id is registered: once a takeover moved the session to another connection,
   `Done` is that connection's; in the moment between the old connection's
@@ -559,7 +565,17 @@ an answer only), and tests that asserted nothing or wrote to a host path.
 MaestroHub reads `Done` on every attempt (`heldPublish.expired`), so the
 "not done" answer during a takeover is re-asked, never a lasting verdict.
 
-Mutation: each of the 29 fixes of the four review rounds, reverted, fails
+**Fifth review (e4e7d74 → this).** The sweep winning the end during a
+connection's tail left its subscriptions behind (a regression of the fourth
+round's compare-and-delete), the sweep never unsubscribed expired sessions
+(upstream), a DUP 0 reuse of a held id answered only — a refused first copy
+left the stored one without an inflight entry, its PUBREL answered 0x92 — and
+a reuse lowered to QoS 1 returned a quota unit it never took; and the
+takeover-versus-end decision, made atomic (`fate`). The reviewer's
+reproductions are `acks_review5_test.go`; `session_fate_test.go` pins the
+decision both ways and the sweep leaving a session being taken over.
+
+Mutation: each of the 35 fixes of the five review rounds, reverted, fails
 at least one test;
 the cross-shard stress runs clean under `-race -count=10`. `-race -count=5` clean
 (`TestServerAddListenersFromConfig` fails on `mh-stable` too, unrelated).
