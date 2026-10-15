@@ -91,7 +91,7 @@ func TestNoAckAfterMqtt3RefusalClosedTheSequencer(t *testing.T) {
 	ready := q.ready
 	q.ready = nil
 	q.mu.Unlock()
-	require.True(t, q.write(cl, ready), "the refusal ends the connection")
+	require.True(t, q.write(cl, ready, writeNow), "the refusal ends the connection")
 
 	// A publish the reader took in before the connection was stopped.
 	later := q.reserve(publishQos(2, 1))

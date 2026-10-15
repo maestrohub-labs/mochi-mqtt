@@ -224,9 +224,15 @@ func newClient(c net.Conn, o *ops) *Client {
 }
 
 // WriteLoop ranges over pending outbound messages and writes them to the client connection.
+//
+// MAESTROHUB PATCH (ack after handled): it is also the client's ack writer —
+// woken by ackSequencer.settle, it writes every publish acknowledgement a
+// hook has settled (acks.go), so no goroutine is started per run of acks.
 func (cl *Client) WriteLoop() {
 	for {
 		select {
+		case <-cl.State.acks.wake:
+			cl.State.acks.writeReady(cl, false)
 		case pk := <-cl.State.outbound:
 			if err := cl.WritePacket(*pk); err != nil {
 				// TODO : Figure out what to do with error
@@ -234,6 +240,10 @@ func (cl *Client) WriteLoop() {
 			}
 			atomic.AddInt32(&cl.State.outboundQty, -1)
 		case <-cl.State.open.Done():
+			// Acks handed over before the close was seen: written to a
+			// closed connection they go nowhere, but writing is reset, so
+			// the sequencer is not left busy (settle drops later ones).
+			cl.State.acks.writeReady(cl, false)
 			return
 		}
 	}
@@ -702,19 +712,20 @@ func (cl *Client) writeAck(pk packets.Packet) error {
 	return cl.writePacket(pk, writeAckCoalesced)
 }
 
-// writeAcks writes acks in order with one write to the connection (or
-// none while the reader is in a burst, see writeAck): every ack but the
-// last is held in the write buffer, and the last decides like writeAck.
+// writeAcks writes acks in order with one write to the connection: every
+// ack but the last is held in the write buffer, and the last is written
+// with mode last — writeAckCoalesced on the reader (none while it is in a
+// burst, see writeAck), writeNow on WriteLoop.
 //
 // MAESTROHUB PATCH (ack after handled): the settled prefix of a client's
 // pending acks goes out together (see ackSequencer).
-func (cl *Client) writeAcks(acks []packets.Packet) error {
+func (cl *Client) writeAcks(acks []*pendingAck, last writeMode) error {
 	for i := range acks {
 		mode := writeHeld
 		if i == len(acks)-1 {
-			mode = writeAckCoalesced
+			mode = last
 		}
-		if err := cl.writePacket(acks[i], mode); err != nil {
+		if err := cl.writePacket(acks[i].ack, mode); err != nil {
 			return err
 		}
 	}
