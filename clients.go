@@ -180,6 +180,7 @@ type ClientState struct {
 	outbound        chan *packets.Packet // queue for pending outbound packets
 	endOnce         sync.Once            // only end once
 	isTakenOver     atomic.Bool          // used to identify orphaned clients
+	fate            atomic.Int32         // MAESTROHUB PATCH: what became of the session, decided once (claimTakeover / claimEnd)
 	packetID        uint32               // the current highest packetID
 	open            context.Context      // indicate that the client is open for packet exchange
 	cancelOpen      context.CancelFunc   // cancel function for open context
@@ -542,6 +543,35 @@ func (cl *Client) Closed() bool {
 
 func (cl *Client) IsTakenOver() bool {
 	return cl.State.isTakenOver.Load()
+}
+
+// MAESTROHUB PATCH: a session ends once — taken over by a new connection
+// under the same client id, or ended (its connection's tail when the
+// session expires with it, or the expiry sweep). The two are decided by
+// one compare-and-swap, so a takeover and an end cannot both believe they
+// own the old session (one inheriting it while the other unsubscribes it
+// and ends its QoS 2 ids), and the tail and the sweep cannot both clean
+// up — whichever wins does all of it.
+const (
+	fateOpen int32 = iota
+	fateTakenOver
+	fateEnded
+)
+
+// claimTakeover marks cl taken over, unless its session already ended;
+// reports whether it did.
+func (cl *Client) claimTakeover() bool {
+	if !cl.State.fate.CompareAndSwap(fateOpen, fateTakenOver) {
+		return false
+	}
+	cl.State.isTakenOver.Store(true)
+	return true
+}
+
+// claimEnd marks cl's session ended, unless it was taken over or already
+// ended; reports whether this call did — and so owns the cleanup.
+func (cl *Client) claimEnd() bool {
+	return cl.State.fate.CompareAndSwap(fateOpen, fateEnded)
 }
 
 // ReadFixedHeader reads in the values of the next packet's fixed header.
