@@ -162,7 +162,10 @@ func TestAckWaitsForSettlement(t *testing.T) {
 
 	h.release(t, 1, packets.CodeSuccess)
 	expectAck(t, wire, packets.Puback, 1)
-	require.Equal(t, int32(10), cl.State.Inflight.receiveQuota, "receive quota returned with the ack")
+	// The quota returns once the ack is written — on the writer's
+	// goroutine, just after the client read it.
+	require.Eventually(t, func() bool { return atomic.LoadInt32(&cl.State.Inflight.receiveQuota) == 10 }, time.Second, time.Millisecond,
+		"receive quota returned with the ack")
 	require.Equal(t, 0, cl.State.Inflight.Len(), "a QoS 1 ack never enters the inflight store")
 }
 

@@ -394,8 +394,9 @@ changes value. `PublishSettlement.Withholds()` says whether an ack waits
 **Trade-off.** One client's acks wait for its slowest pending message, so a
 client's in-flight window (and the server's Receive Maximum) bounds its
 throughput by the handler's latency, as on any broker that acknowledges after
-storing. A QoS 2 PUBLISH resent while its first copy is still being handled is
-handled twice (there is no inflight entry yet to recognise it).
+storing. (Two defects of this first version are fixed in patch 10: acks were
+written on the releasing goroutine, and a QoS 2 PUBLISH resent while its first
+copy was still being handled was handled twice.)
 
 **Tests.** `acks_test.go`: ack waits for release; arrival order with
 out-of-order releases; settled prefix in one write; refusal behind a pending
@@ -405,6 +406,79 @@ back-pressure; MQTT 5 still disconnected past Receive Maximum; no hook →
 immediate ack; a second release ignored; `Withholds`/`Done`; a refusal code
 reaching an MQTT 5 client. Mutation: disabling the deferral makes
 10 of them fail.
+
+### 10. Acks are written by the client's own writer; a QoS 2 resend is not handled twice (v2.7.9-mh.10)
+
+**Upstream PR:** to be folded into patch 9's upstream PR
+(mochi-mqtt/server#553) — same feature.
+
+**Problems (independent review of patch 9, 2026-10-15).**
+
+- `ackSequencer.settle` wrote the settled acks while holding the sequencer's
+  lock, on the goroutine that released the hold. In MaestroHub that is a
+  shared worker; a client that stops reading its socket blocks the write
+  (`cl.Lock` in `writePacket`), and every worker that settles one of its
+  publishes then waits too — 7–8 of 8 workers in the reviewer's reproduction,
+  after which healthy clients' publishes ran without workers.
+- A QoS 2 PUBLISH resent while its PUBREC was held (not yet in the inflight
+  store) was handled again: on the same connection, and on the connection
+  that resumed the session after a reconnect (the reviewer's handler ran
+  twice). QoS 2 is exactly once.
+
+**Fix.**
+
+- Releasing a hold never writes. `settle` moves the settled prefix to the
+  client's `ready` list and starts its ack writer (`writeReady`), a goroutine
+  that writes in order until nothing is ready and then exits — only it can
+  block on a slow client. The server's own hold, released on the client's
+  reader at the end of `processPublish`, writes inline when no writer runs:
+  hooks that settle synchronously cost no goroutine, and the reader blocking
+  on its own client is back-pressure. A refusal decided on arrival
+  (`writeNowOrQueue`) goes behind acks that are settled but not yet written.
+  Receive quota returns when the writer has written the ack. After a refusal
+  an MQTT 3 client cannot be told, the sequencer is closed under its lock:
+  nothing is written after it, even before the connection is stopped.
+- QoS 2: a session-scoped registry (`acks_qos2.go`) of the packet ids
+  received and not yet released, keyed by client id and packet id, so it
+  outlives a connection. Each entry holds the publish's verdict once its
+  hooks are done, and the PUBRECs waiting for it: the first copy's, and one
+  per resend — each reserved in the queue of the connection its copy arrived
+  on, in that connection's arrival order, and bound to it for life. Settling
+  the first copy settles them all; a resend after that is answered at once.
+  The entry is registered before `OnPublish`, ends at PUBREL, on a refusal
+  (the flow ends) or with the session, and a PUBLISH reusing a registered id
+  without DUP is a new message (its entry replaces the old). Bounded per
+  session by the Receive Maximum.
+- `PublishSettlement.Done` follows the session for a QoS 2 publish: once a
+  takeover moved the session to another live connection, the verdict still
+  reaches the client, so `Done` is that connection's.
+
+**Design note (rule 27).** A first version moved held PUBRECs between
+connections at takeover (`adopt`) and swapped each ack's owner; the review
+found a race and lost wakeup between a release and the move, plus three
+gaps. Recording the id in the session's inflight store at receipt (as
+upstream does) recognises a resend but cannot answer it after a takeover:
+the store is cloned, and the verdict lives with the old connection, so no
+PUBREC would ever reach the new one. The registry is the smallest shape that
+does both — nothing moves, no owner is swapped.
+
+**Remaining window.** A QoS 2 PUBLISH is registered after the receive-quota
+wait and the ACL check: a resend processed on a new connection while the old
+connection's reader sits between reading the PUBLISH and that point is
+handled a second time. A refused PUBREC (a hook's failure code) ends the
+flow; a later resend is a new attempt.
+
+**Tests.** `acks_nonblocking_test.go`: a release does not block on a client
+that does not read (unread `net.Pipe`), and the acks arrive in order once it
+reads; a refusal does not overtake acks being written (with a watchdog);
+nothing is written after an MQTT 3 refusal closed the sequencer.
+`acks_qos2_resend_test.go`: a resend while the PUBREC is held, after it is
+settled but unwritten, after a takeover, after a takeover of a settled
+publish, after two takeovers; a DUP 0 reuse of an id is handled; a release
+racing the takeover always answers the resend (200 iterations); PUBREL and a
+session end free the registry; `Done` follows the session. Mutation: each of
+seven fixes, reverted, fails at least one of them. `-race -count=5` clean
+(`TestServerAddListenersFromConfig` fails on `mh-stable` too, unrelated).
 
 ## Upstream sync
 

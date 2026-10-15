@@ -18,6 +18,13 @@ package mqtt
 // the order the PUBLISHes were received). One client's acks wait for its
 // slowest pending publish; other clients are not involved — each client
 // has its own sequencer.
+//
+// Releasing a hold never writes to the connection: the goroutine that
+// releases belongs to the hook (often a shared worker pool), and a client
+// that stops reading its socket would block it — and every other worker
+// that settles one of its publishes. Settled acks are handed to the
+// client's own ack writer, a goroutine that runs while there are acks to
+// write and exits when there are none; it alone blocks on a slow client.
 
 import (
 	"sync"
@@ -37,6 +44,11 @@ type PublishSettlement struct {
 	cl    *Client
 	ack   *pendingAck // nil: nothing to acknowledge
 	holds atomic.Int32
+	// QoS 2 only: the session's registry entry for the packet id, which
+	// settles this PUBREC and every resend's (acks_qos2.go).
+	srv  *Server
+	qos2 *qos2Entry
+	id   uint16
 	// failed is the first refusal a release reported (nil: none).
 	failed atomic.Pointer[packets.Code]
 }
@@ -62,7 +74,7 @@ func (s *PublishSettlement) Hold() (release func(code packets.Code)) {
 		if once.Swap(true) {
 			return
 		}
-		s.release(code)
+		s.release(code, false)
 	}
 }
 
@@ -73,17 +85,29 @@ func (s *PublishSettlement) Withholds() bool {
 	return s != nil && s.ack != nil
 }
 
-// Done is closed when the client the publish came from is gone: an
-// acknowledgement could no longer reach it. Nil (never closed) when the
-// settlement withholds nothing.
+// Done is closed when no connection can be told the verdict any more:
+// the client the publish came from is gone. For a QoS 2 publish whose
+// session another connection has resumed, the verdict still reaches the
+// client (a resend of it waits for it, acks_qos2.go), so Done is then
+// that connection's. Call it again for a fresh answer after it fires.
+// Nil (never closed) when the settlement withholds nothing.
 func (s *PublishSettlement) Done() <-chan struct{} {
 	if !s.Withholds() || s.cl.State.open == nil {
 		return nil
 	}
+	if s.qos2 != nil && s.cl.Closed() && s.srv != nil {
+		if c, ok := s.srv.Clients.Get(s.cl.ID); ok && c != s.cl && !c.Closed() && c.State.open != nil {
+			return c.State.open.Done()
+		}
+	}
 	return s.cl.State.open.Done()
 }
 
-func (s *PublishSettlement) release(code packets.Code) {
+// release drops one hold. onReader: the caller is the client's own reader
+// (the server's hold, released at the end of processPublish), which may
+// write the acks itself — blocking only on its own client — instead of
+// handing them to the writer goroutine.
+func (s *PublishSettlement) release(code packets.Code, onReader bool) {
 	if code.Code >= packets.ErrUnspecifiedError.Code {
 		s.failed.CompareAndSwap(nil, &code)
 	}
@@ -94,7 +118,15 @@ func (s *PublishSettlement) release(code packets.Code) {
 	if f := s.failed.Load(); f != nil {
 		reason = *f
 	}
-	s.cl.State.acks.settle(s.cl, s.ack, reason)
+	if s.qos2 != nil {
+		var reader *Client
+		if onReader {
+			reader = s.cl
+		}
+		s.srv.qos2.settle(s.cl.ID, s.id, s.qos2, reason, reader)
+		return
+	}
+	s.cl.State.acks.settle(s.cl, s.ack, reason, onReader)
 }
 
 // pendingAck is one acknowledgement waiting for its turn.
@@ -110,11 +142,20 @@ type pendingAck struct {
 
 // ackSequencer writes one client's publish acknowledgements in arrival
 // order, each once it is settled. All of a client's QoS 1/2 publish acks go
-// through it while any is pending, so a refusal written at once cannot
-// overtake an earlier publish still being handled.
+// through it while any is pending or being written, so a refusal written
+// at once cannot overtake an earlier publish still being handled.
 type ackSequencer struct {
 	mu      sync.Mutex
 	pending []*pendingAck
+	// ready are settled acks, in order, handed to the writer goroutine;
+	// writing is true while it runs (it writes ready, then exits once
+	// ready is empty).
+	ready   []*pendingAck
+	writing bool
+	// closed: a refusal an MQTT 3 client cannot be told ended the
+	// connection; no ack is written after it ([MQTT-4.6.0-2]: no PUBACK
+	// for a later publish without the earlier one's).
+	closed bool
 	// freed gets a token whenever an ack returned receive quota; the
 	// reader waits on it (waitForQuota).
 	freed chan struct{}
@@ -134,44 +175,98 @@ func (q *ackSequencer) reserve(ack packets.Packet) *pendingAck {
 	return p
 }
 
-// busy reports whether acknowledgements are waiting.
+// busy reports whether acknowledgements are waiting (to be settled, or
+// to be written).
 func (q *ackSequencer) busy() bool {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-	return len(q.pending) > 0
+	return len(q.pending) > 0 || len(q.ready) > 0 || q.writing
 }
 
 // writeNowOrQueue writes an ack that needs no handling (a refusal decided
-// on arrival) — at once if nothing is pending, else behind the pending
-// ones.
+// on arrival) — at once if nothing is pending or being written, else
+// behind those. Called by the client's reader.
 func (q *ackSequencer) writeNowOrQueue(cl *Client, ack packets.Packet) error {
 	q.mu.Lock()
+	if q.closed {
+		q.mu.Unlock()
+		return nil
+	}
+	if len(q.pending) == 0 && len(q.ready) == 0 && !q.writing {
+		q.mu.Unlock()
+		return cl.WritePacket(ack)
+	}
 	defer q.mu.Unlock()
 	if len(q.pending) == 0 {
-		return cl.WritePacket(ack)
+		// Nothing to wait for but acks being written: after them.
+		q.ready = append(q.ready, &pendingAck{ack: ack, settled: true})
+		return nil
 	}
 	q.pending = append(q.pending, &pendingAck{ack: ack, settled: true})
 	return nil
 }
 
-// settle marks p settled and writes every settled ack at the head of the
-// queue. Writing happens under the sequencer's lock, which is what keeps
-// two settling goroutines from interleaving their writes out of order.
-func (q *ackSequencer) settle(cl *Client, p *pendingAck, reason packets.Code) {
+// settle marks p settled and hands every settled ack at the head of the
+// queue to the client's writer, starting it if it is not running. It
+// never writes on a hook's goroutine (see the file comment); called on
+// the client's reader (onReader) with no writer running, the reader
+// writes them itself — the common case of hooks that settle before
+// processPublish returns, at no goroutine's cost.
+func (q *ackSequencer) settle(cl *Client, p *pendingAck, reason packets.Code, onReader bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	p.settled, p.reason = true, reason
+	if q.closed || !q.flushSettledLocked(cl) || q.writing {
+		return
+	}
+	q.writing = true
+	if onReader {
+		q.mu.Unlock()
+		q.writeReady(cl)
+		q.mu.Lock() // for the deferred Unlock
+		return
+	}
+	go q.writeReady(cl)
+}
 
+// flushSettledLocked moves the settled prefix of pending to ready and
+// reports whether there was one. Caller holds q.mu.
+func (q *ackSequencer) flushSettledLocked(cl *Client) bool {
 	n := 0
 	for n < len(q.pending) && q.pending[n].settled {
 		n++
 	}
 	if n == 0 {
-		return
+		return false
 	}
-	ready := q.pending[:n]
+	q.ready = append(q.ready, q.pending[:n]...)
 	q.pending = append(q.pending[:0:0], q.pending[n:]...)
+	return true
+}
 
+// writeReady is the client's ack writer: it writes the settled acks in
+// order until none are left, then exits. Only one runs per client
+// (writing), so order holds without a lock around the writes.
+func (q *ackSequencer) writeReady(cl *Client) {
+	for {
+		q.mu.Lock()
+		ready := q.ready
+		q.ready = nil
+		if len(ready) == 0 || q.closed {
+			q.writing = false
+			q.mu.Unlock()
+			return
+		}
+		q.mu.Unlock()
+		if q.write(cl, ready) {
+			return // disconnected: what is left is the client's to resend
+		}
+	}
+}
+
+// write writes one run of settled acks; reports whether it ended the
+// connection (a failure an MQTT 3 client cannot be told).
+func (q *ackSequencer) write(cl *Client, ready []*pendingAck) (disconnected bool) {
 	acks := make([]packets.Packet, 0, len(ready))
 	reserved := make([]bool, 0, len(ready))
 	disconnect := false
@@ -191,14 +286,20 @@ func (q *ackSequencer) settle(cl *Client, p *pendingAck, reason packets.Code) {
 		reserved = append(reserved, r.reserved)
 	}
 	if disconnect {
-		q.pending = nil
+		// Closed under the lock: no settle after this writes anything,
+		// even before the Stop below has ended the connection.
+		q.mu.Lock()
+		q.pending, q.ready, q.writing, q.closed = nil, nil, false, true
+		q.mu.Unlock()
 	}
 
 	if len(acks) > 0 {
 		_ = cl.writeAcks(acks) // a closed client: the acks go nowhere, the client resends
-		for i := range acks {
-			if reserved[i] {
-				cl.ackWritten(acks[i])
+		if !cl.Closed() {      // a dead connection's session state is not this client's any more
+			for i := range acks {
+				if reserved[i] {
+					cl.ackWritten(acks[i])
+				}
 			}
 		}
 		select {
@@ -209,6 +310,7 @@ func (q *ackSequencer) settle(cl *Client, p *pendingAck, reason packets.Code) {
 	if disconnect {
 		cl.Stop(packets.ErrUnspecifiedError)
 	}
+	return disconnect
 }
 
 // ackWritten does, for an ack the sequencer wrote, what processPublish does
