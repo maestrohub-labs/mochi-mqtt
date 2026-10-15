@@ -88,8 +88,10 @@ func (r *qos2Registry) shard(clientID string) *qos2Shard {
 // claim registers a QoS 2 PUBLISH before it is handled. A resend (DUP) of
 // a registered id returns that entry and resent=true: it is not handled
 // again; the caller adds its PUBREC with wait. Anything else gets a new
-// entry (replacing a stale one on a DUP 0 reuse of the id).
-func (r *qos2Registry) claim(clientID string, id uint16, dup bool) (e *qos2Entry, resent bool) {
+// entry, replacing a stale one on a DUP 0 reuse of the id; if cl already
+// holds that id's quota (inherited), the new entry carries the
+// reservation over and the caller takes no second unit.
+func (r *qos2Registry) claim(clientID string, id uint16, dup bool, cl *Client) (e *qos2Entry, resent, inherited bool) {
 	sh := r.shard(clientID)
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
@@ -101,12 +103,19 @@ func (r *qos2Registry) claim(clientID string, id uint16, dup bool) (e *qos2Entry
 		ids = map[uint16]*qos2Entry{}
 		sh.m[clientID] = ids
 	}
-	if old, ok := ids[id]; ok && dup {
-		return old, true
+	old, ok := ids[id]
+	if ok && dup {
+		return old, true, false
 	}
 	e = &qos2Entry{}
+	if ok {
+		if _, held := old.reserved[cl]; held {
+			e.reserved = map[*Client]struct{}{cl: {}}
+			inherited = true
+		}
+	}
 	ids[id] = e
-	return e, false
+	return e, false, inherited
 }
 
 // firstReservation reports whether cl holds no reservation for e yet (and
