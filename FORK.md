@@ -456,11 +456,29 @@ reaching an MQTT 5 client. Mutation: disabling the deferral makes
   Receive Maximum); an id whose PUBREL never comes stays until the session
   ends — at most one per packet id, 65,536 per session. Sharded by client id
   (64 shards): sessions never contend.
-- A PUBLISH resent after its PUBREC was written is answered with its stored
-  verdict (upstream answered 0x91 "packet identifier in use", which an MQTT 5
-  client reads as a failure of a stored message), and an MQTT 5 QoS 2 PUBLISH
-  refused with a reason code in `OnPublish` gets a PUBREC (upstream wrote a
-  PUBACK).
+- A PUBLISH resent (DUP) after its PUBREC was written is answered with its
+  stored verdict (upstream answered 0x91 "packet identifier in use", which an
+  MQTT 5 client reads as a failure of a stored message); a DUP 0 PUBLISH
+  reusing that id keeps upstream's 0x91. The verdict lives as long as the
+  process: a session restored from a storage hook after a restart has none,
+  and its resends get 0x91 again. An MQTT 5 QoS 2 PUBLISH refused with a
+  reason code in `OnPublish` gets a PUBREC (upstream wrote a PUBACK).
+- A copy a hook lowers to QoS 1 keeps its entry until its own verdict: resends
+  waiting on it are answered with that verdict, never before it; then the id
+  is dropped (no PUBREL will come for it). A resend on a connection that
+  already holds a reservation for the id is queued as an answer only: written,
+  it returns no receive quota and enters nothing in the inflight store.
+- A PUBREL carrying a failure reason ends the flow and frees the id.
+- `Inflight.NextImmediate` read-locked twice (an upstream bug, in mh.9 too):
+  Go's RWMutex is not reentrant for readers — once a writer waits, the nested
+  RLock blocks and the outer one never returns. With acks written off the
+  reader, the ack writer's `Set` (ackWritten) raced the reader's
+  `NextImmediate` and both waited forever; any publisher routing to that
+  client then blocked too. The outer lock is gone (`GetAll` takes it).
+- The old client of a takeover is marked taken over before it is
+  disconnected, on a clean start too: its own `attachClient` tail
+  (`expire && !IsTakenOver()`) can no longer delete the session — the new
+  client's — after the new client was registered.
 - `PublishSettlement.Done` follows the session for a QoS 2 publish while its
   id is registered: once a takeover moved the session to another connection,
   `Done` is that connection's; in the moment between the old connection's
@@ -490,9 +508,19 @@ held every later ack of its connection; R3 a resend returned before its topic
 alias was registered; R4 a 0x92 PUBREL left the id registered; R5 `Done`
 during the takeover window; R6 one registry lock for all sessions; plus the
 two upstream answers above. All fixed; the reviewer's reproductions are kept
-as `acks_qos2_review_test.go`. Not covered by a test: the order of the
-taken-over mark and the disconnect inside `inheritClientSession` (the window
-cannot be observed from outside); the "not done" answer it enables is.
+as `acks_qos2_review_test.go`.
+
+**Third review (a71a7a7 → this).** The `NextImmediate` deadlock (reproduced
+after 440–1,240 exchanges at a71a7a7, 24,440 at mh.9); a copy lowered to QoS 1
+let a waiting resend be acknowledged before the copy was settled; a failed
+PUBREL left the id registered (a later first-seen DUP copy was answered from
+it and never handled); a DUP 0 reuse got 0x00; two answers on one connection
+returned quota twice on a refusal; the clean-start takeover tail; the mutation
+gap on the early taken-over mark. Fixed; the reviewer's tests are kept as
+`acks_qos2_review3_test.go` and `inflight_deadlock_test.go` (160,000 QoS 2
+exchanges with PUBRECs settled off the reader), and
+`TestTakeoverMarksTheOldClientBeforeDisconnectingIt` now pins the order the
+second review could not (a hook sees the DISCONNECT the old client is sent).
 
 **Tests.** `acks_nonblocking_test.go`: a release does not block on a client
 that does not read (unread `net.Pipe`), and the acks arrive in order once it
@@ -511,7 +539,8 @@ is a PUBREC; a resend after the PUBREC was written gets its verdict.
 `acks_qos2_review_test.go`: the second review's reproductions (quota leak,
 stranded waiter, topic alias, the old reader after a takeover, an MQTT 3
 refusal withholding later acks, a release/takeover/PUBREL stress). Mutation: each of
-the eighteen fixes that can be observed, reverted, fails at least one test. `-race -count=5` clean
+the 24 fixes of the three review rounds, reverted, fails at least one test;
+the cross-shard stress runs clean under `-race -count=10`. `-race -count=5` clean
 (`TestServerAddListenersFromConfig` fails on `mh-stable` too, unrelated).
 
 ## Upstream sync

@@ -145,8 +145,11 @@ func (r *qos2Registry) wait(clientID string, e *qos2Entry, w qos2Waiter) {
 // refusal ends the flow: the entry is dropped (a resend is handled anew).
 // reader, when set, is the connection whose own reader is releasing: it may
 // write its acks itself (see PublishSettlement.release).
-func (r *qos2Registry) settle(clientID string, id uint16, e *qos2Entry, reason packets.Code, reader *Client) {
-	r.finish(clientID, id, e, reason, reader, reason.Code >= packets.ErrUnspecifiedError.Code)
+// lowered: a hook handled the copy as QoS 1; no PUBREL will release the
+// id, so it is dropped too (a resend answered here is released on its own
+// connection).
+func (r *qos2Registry) settle(clientID string, id uint16, e *qos2Entry, reason packets.Code, reader *Client, lowered bool) {
+	r.finish(clientID, id, e, reason, reader, lowered || reason.Code >= packets.ErrUnspecifiedError.Code)
 }
 
 // abandon ends e when its PUBLISH was dropped before being handled (a hook

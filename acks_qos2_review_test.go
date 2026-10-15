@@ -242,7 +242,7 @@ func BenchmarkReview_RegistryParallel(b *testing.B) {
 		for pb.Next() {
 			pid++
 			e, _ := r.claim(id, pid, false)
-			r.settle(id, pid, e, packets.CodeSuccess, nil)
+			r.settle(id, pid, e, packets.CodeSuccess, nil, false)
 			r.release(id, pid)
 		}
 	})

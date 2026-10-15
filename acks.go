@@ -49,6 +49,9 @@ type PublishSettlement struct {
 	srv  *Server
 	qos2 *qos2Entry
 	id   uint16
+	// qos2Lowered: a QoS 2 PUBLISH a hook lowered to QoS 1; its entry is
+	// dropped once settled (no PUBREL will release it).
+	qos2Lowered bool
 	// failed is the first refusal a release reported (nil: none).
 	failed atomic.Pointer[packets.Code]
 }
@@ -132,7 +135,7 @@ func (s *PublishSettlement) release(code packets.Code, onReader bool) {
 		if onReader {
 			reader = s.cl
 		}
-		s.srv.qos2.settle(s.cl.ID, s.id, s.qos2, reason, reader)
+		s.srv.qos2.settle(s.cl.ID, s.id, s.qos2, reason, reader, s.qos2Lowered)
 		return
 	}
 	s.cl.State.acks.settle(s.cl, s.ack, reason, onReader)
@@ -178,6 +181,17 @@ func (q *ackSequencer) init() {
 // client's reader, so the queue order is the arrival order.
 func (q *ackSequencer) reserve(ack packets.Packet) *pendingAck {
 	p := &pendingAck{ack: ack, reserved: true}
+	q.mu.Lock()
+	q.pending = append(q.pending, p)
+	q.mu.Unlock()
+	return p
+}
+
+// queueAnswer appends, in arrival order, an ack that answers a resend on a
+// connection that already holds a reservation for its id (acks_qos2.go):
+// written, it returns no quota and enters nothing in the inflight store.
+func (q *ackSequencer) queueAnswer(ack packets.Packet) *pendingAck {
+	p := &pendingAck{ack: ack}
 	q.mu.Lock()
 	q.pending = append(q.pending, p)
 	q.mu.Unlock()

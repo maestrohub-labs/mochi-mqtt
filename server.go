@@ -660,19 +660,19 @@ func (s *Server) validateConnect(cl *Client, pk packets.Packet) packets.Code {
 func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
 	if existing, ok := s.Clients.Get(cl.ID); ok {
 		clean := pk.Connect.Clean || (existing.Properties.Clean && existing.Properties.ProtocolVersion < 5) // [MQTT-3.1.2-4] [MQTT-3.1.4-4]
-		if !clean {
-			// MAESTROHUB PATCH: marked before it is disconnected, so nothing
-			// that sees the old connection closed takes the session for
-			// ended (PublishSettlement.Done) while it moves to cl.
-			existing.State.isTakenOver.Store(true)
-		}
+		// MAESTROHUB PATCH: marked before it is disconnected. Then nothing
+		// that sees the old connection closed takes the session for ended
+		// (PublishSettlement.Done) while it moves to cl, and the old
+		// connection's own tail (attachClient: expire && !IsTakenOver) can
+		// no longer delete the session — the new client's — after cl was
+		// registered. Here, not the old tail, cleans a clean start up.
+		existing.State.isTakenOver.Store(true)
 		_ = s.DisconnectClient(existing, packets.ErrSessionTakenOver) // [MQTT-3.1.4-3]
 		if clean {
 			s.UnsubscribeClient(existing)
 			existing.ClearInflights()
-			s.qos2.endSession(existing.ID)         // MAESTROHUB PATCH (acks_qos2.go)
-			existing.State.isTakenOver.Store(true) // only set isTakenOver after unsubscribe has occurred
-			return false                           // [MQTT-3.2.2-3]
+			s.qos2.endSession(existing.ID) // MAESTROHUB PATCH (acks_qos2.go)
+			return false                   // [MQTT-3.2.2-3]
 		}
 
 		existing.State.isTakenOver.Store(true)
@@ -1030,8 +1030,11 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 				// registry still holds (acks_qos2.go) — not 0x91, which an
 				// MQTT 5 client reads as a failure of a message that was
 				// stored. Without a known verdict, upstream's answer.
+				// A DUP 0 PUBLISH reusing the id is not a resend: upstream's
+				// answer stands for it. The verdict lives as long as the
+				// process (a session restored from storage has none).
 				reason := packets.ErrPacketIdentifierInUse
-				if v, ok := s.qos2.verdict(cl.ID, pk.PacketID); ok {
+				if v, ok := s.qos2.verdict(cl.ID, pk.PacketID); ok && pk.FixedHeader.Dup {
 					reason = v
 				}
 				ack := s.buildAck(pk.PacketID, packets.Pubrec, 0, pk.Properties, reason)
@@ -1059,12 +1062,19 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 		e, resent := s.qos2.claim(cl.ID, pk.PacketID, pk.FixedHeader.Dup)
 		if resent {
 			// Receive quota is taken once per connection for an id: a
-			// resend on the connection that already holds it takes none.
+			// resend on the connection that already holds it takes none,
+			// and its PUBREC is not "reserved" — written, it returns no
+			// quota and enters nothing in the inflight store; the
+			// connection's first one does.
+			ack := s.buildAck(pk.PacketID, packets.Pubrec, 0, pk.Properties, packets.CodeSuccess)
+			var p *pendingAck
 			if s.qos2.firstReservation(cl.ID, e, cl) {
 				cl.State.Inflight.DecreaseReceiveQuota() // until PUBREL, as for the copy it stands for
+				p = cl.State.acks.reserve(ack)
+			} else {
+				p = cl.State.acks.queueAnswer(ack)
 			}
-			ack := s.buildAck(pk.PacketID, packets.Pubrec, 0, pk.Properties, packets.CodeSuccess)
-			s.qos2.wait(cl.ID, e, qos2Waiter{cl: cl, p: cl.State.acks.reserve(ack)})
+			s.qos2.wait(cl.ID, e, qos2Waiter{cl: cl, p: p})
 			return nil
 		}
 		qos2 = e
@@ -1132,11 +1142,17 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 	// resumed meanwhile never resends an ack for a message not handled.
 	if s.hooks.Provides(OnPublishedSettle) {
 		settlement := &PublishSettlement{cl: cl, ack: cl.State.acks.reserve(ack)}
-		if qos2 != nil && pk.FixedHeader.Qos == 2 {
+		if qos2 != nil {
+			// Handled — as QoS 2, or lowered to QoS 1 by a hook: resends
+			// waiting on it get its real verdict, never one before it.
 			settlement.srv, settlement.qos2, settlement.id = s, qos2, pk.PacketID
-			s.qos2.firstReservation(cl.ID, qos2, cl) // its quota was taken above
+			if pk.FixedHeader.Qos == 2 {
+				s.qos2.firstReservation(cl.ID, qos2, cl) // its quota was taken above
+			} else {
+				settlement.qos2Lowered = true // no PUBREL will come for it: dropped once settled
+			}
 			s.qos2.wait(cl.ID, qos2, qos2Waiter{cl: cl, p: settlement.ack})
-			qos2 = nil // handled: the entry lives until PUBREL
+			qos2 = nil
 		}
 		settlement.holds.Store(1) // the server's own, released below
 		s.publishToSubscribers(pk)
@@ -1410,6 +1426,7 @@ func (s *Server) processPubrel(cl *Client, pk packets.Packet) error {
 	}
 
 	if pk.ReasonCode >= packets.ErrUnspecifiedError.Code || !pk.ReasonCodeValid() { // [MQTT-4.3.3-9]
+		s.qos2.release(cl.ID, pk.PacketID) // MAESTROHUB PATCH: the flow ended (acks_qos2.go)
 		if ok := cl.State.Inflight.Delete(pk.PacketID); ok {
 			atomic.AddInt64(&s.Info.Inflight, -1)
 		}

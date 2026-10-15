@@ -158,3 +158,47 @@ func TestQos2ResendAfterPubrecWrittenGetsTheVerdict(t *testing.T) {
 	require.Equal(t, packets.CodeSuccess.Code, p.reason, "a resend of a stored message was answered as a failure")
 	require.Equal(t, int32(1), h.seen.Load())
 }
+
+// takeoverWitness records, as the old connection is sent its DISCONNECT
+// (inside the takeover), whether it was already marked taken over.
+type takeoverWitness struct {
+	HookBase
+	marked atomic.Int32 // 1: marked, 2: not marked
+}
+
+func (h *takeoverWitness) ID() string           { return "takeover-witness" }
+func (h *takeoverWitness) Provides(b byte) bool { return b == OnPacketEncode }
+func (h *takeoverWitness) OnPacketEncode(cl *Client, pk packets.Packet) packets.Packet {
+	if pk.FixedHeader.Type == packets.Disconnect {
+		if cl.IsTakenOver() {
+			h.marked.Store(1)
+		} else {
+			h.marked.Store(2)
+		}
+	}
+	return pk
+}
+
+// Third review, item 8 (and the old connection's own tail, item 7): the old
+// client is marked taken over BEFORE it is disconnected — for a resumed
+// session and a clean start alike — so nothing that sees it closed takes
+// the session for ended, and its attachClient tail cannot delete the session
+// the new client is about to hold.
+func TestTakeoverMarksTheOldClientBeforeDisconnectingIt(t *testing.T) {
+	for _, clean := range []bool{false, true} {
+		s := newServer()
+		h := &takeoverWitness{}
+		require.NoError(t, s.AddHook(h, nil))
+		old, r, _ := newTestClient()
+		old.ops.hooks = s.hooks // its writes go through the server's hooks, as a real client's do
+		go func() { _, _ = io.Copy(io.Discard, r) }()
+		old.ID = "witness"
+		old.Properties.ProtocolVersion = 5
+		s.Clients.Add(old)
+		cl, _, _ := newTestClient()
+		cl.ID = "witness"
+		cl.Properties.ProtocolVersion = 5
+		s.inheritClientSession(packets.Packet{Connect: packets.ConnectParams{ClientIdentifier: "witness", Clean: clean}}, cl)
+		require.Equal(t, int32(1), h.marked.Load(), "clean=%v: the old client was disconnected before it was marked taken over (witness %d: 0 none seen, 2 unmarked)", clean, h.marked.Load())
+	}
+}
