@@ -1477,13 +1477,15 @@ var TPacketData = map[byte]TPacketCases{
 				0, 5, 'h', 'e', 'l', 'l', 'o',
 				0, 6, 228, 184, 150, 231, 149, 140,
 			},
+			// MAESTROHUB PATCH: upstream pinned a 24-byte packet for a client
+			// whose maximum is 18 (the Reason String kept). With the whole
+			// packet judged, neither optional property fits: 15 bytes.
 			ActualBytes: []byte{
-				Connack << 4, 22, // fixed header
+				Connack << 4, 13, // fixed header
 				0, // No existing session
 				CodeSuccess.Code,
-				19,                                          // length
+				10,                                          // length
 				28, 0, 7, 'm', 'o', 'c', 'h', 'i', '-', '2', // Server Reference (28)
-				31, 0, 6, 'r', 'e', 'a', 's', 'o', 'n', // Reason String (31)
 			},
 			Packet: &Packet{
 				Mods: Mods{

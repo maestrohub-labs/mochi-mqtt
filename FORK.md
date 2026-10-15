@@ -598,6 +598,34 @@ at least one test;
 the cross-shard stress runs clean under `-race -count=10`. `-race -count=5` clean
 (`TestServerAddListenersFromConfig` fails on `mh-stable` too, unrelated).
 
+### 11. Optional properties are judged on the whole packet size (v2.7.9-mh.13)
+
+**Problem.** A client's Maximum Packet Size forbids the server to send a
+Reason String or User Properties that would make a packet larger than it
+([MQTT-3.4.2-2] [MQTT-3.4.2-3], and the same rule for PUBREC, PUBREL,
+PUBCOMP, SUBACK, UNSUBACK, CONNACK, DISCONNECT, AUTH). Upstream's
+`Properties.Encode` compared only the bytes before the properties plus the
+property against the limit — not the fixed header, a PUBACK's reason code,
+an UNSUBACK's reason codes or the property length — so a packet a few
+bytes over the limit kept the property, and `writePacket` then refused the
+whole packet (`ErrPacketTooLarge`). Since patch 10 an ack that cannot be
+written ends the connection, so this became a disconnect: an MQTT 5 refusal
+PUBACK with Reason String "abcdefghij" (19 bytes) to a client whose maximum
+is 16–18.
+
+**Fix.** `Encode` encodes the properties, and while the whole packet is over
+the limit encodes them again without the User Properties, then without the
+Reason String, then without both (the Reason String is kept in preference).
+The callers pass the true length of the rest of the remaining length
+(CONNACK no longer counts its two bytes twice; PUBACK/PUBREC/PUBREL/PUBCOMP
+count the reason code that precedes properties; UNSUBACK counts its reason
+codes). The upstream fixture `TConnackDropPropertiesPartial`, which expected
+a 24-byte packet for a maximum of 18, now expects the 15-byte packet.
+
+**Tests.** `packets/properties_maxsize_test.go`: every size from the bare
+packet to one past the full packet, for both properties and every packet
+type above (and PUBLISH's User Properties); the 15–19-byte PUBACK boundary.
+
 ## Upstream sync
 
 ```sh
