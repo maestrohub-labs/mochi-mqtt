@@ -476,9 +476,16 @@ reaching an MQTT 5 client. Mutation: disabling the deferral makes
   `NextImmediate` and both waited forever; any publisher routing to that
   client then blocked too. The outer lock is gone (`GetAll` takes it).
 - The old client of a takeover is marked taken over before it is
-  disconnected, on a clean start too: its own `attachClient` tail
-  (`expire && !IsTakenOver()`) can no longer delete the session — the new
-  client's — after the new client was registered.
+  disconnected, on a clean start too. A clean start then removes the old
+  session's subscriptions from the topic index itself (`unsubscribeAll`):
+  `UnsubscribeClient` skips the index for a client taken over, which is
+  why upstream marked only after unsubscribing ([MQTT-3.1.2-4]).
+- The end of a session — a connection's own `attachClient` tail and the
+  expiry sweep — deletes the client id only while it still maps to that
+  client (`Clients.deleteIf`), and only then ends its QoS 2 ids: a new
+  connection that took the id since keeps its session. (Marking alone left
+  a check-then-act: an old connection failing on its own could still
+  delete the new client.)
 - `PublishSettlement.Done` follows the session for a QoS 2 publish while its
   id is registered: once a takeover moved the session to another connection,
   `Done` is that connection's; in the moment between the old connection's
@@ -538,8 +545,22 @@ sweep and a session ending with its connection (end to end) free the ids;
 is a PUBREC; a resend after the PUBREC was written gets its verdict.
 `acks_qos2_review_test.go`: the second review's reproductions (quota leak,
 stranded waiter, topic alias, the old reader after a takeover, an MQTT 3
-refusal withholding later acks, a release/takeover/PUBREL stress). Mutation: each of
-the 24 fixes of the three review rounds, reverted, fails at least one test;
+refusal withholding later acks, a release/takeover/PUBREL stress).
+`acks_qos2_review4_test.go` and `clients_deleteif_test.go`: a clean start
+drops the old subscriptions; a lowered copy's full flow and freed entry;
+three answers on one connection; a DUP 0 reuse while held keeps quota; an
+ending connection and the expiry sweep keep a session that replaced theirs.
+
+**Fourth review (7a3701b → this).** The clean-start takeover regression
+(the old session kept routing — the mark before `UnsubscribeClient`), the
+session-end check-then-act, a DUP 0 reuse while held losing a quota unit
+(it now inherits the connection's reservation: no second unit, its PUBREC
+an answer only), and tests that asserted nothing or wrote to a host path.
+MaestroHub reads `Done` on every attempt (`heldPublish.expired`), so the
+"not done" answer during a takeover is re-asked, never a lasting verdict.
+
+Mutation: each of the 29 fixes of the four review rounds, reverted, fails
+at least one test;
 the cross-shard stress runs clean under `-race -count=10`. `-race -count=5` clean
 (`TestServerAddListenersFromConfig` fails on `mh-stable` too, unrelated).
 

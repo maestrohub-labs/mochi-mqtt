@@ -582,10 +582,11 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 	expire := (cl.Properties.ProtocolVersion == 5 && cl.Properties.Props.SessionExpiryInterval == 0) || (cl.Properties.ProtocolVersion < 5 && cl.Properties.Clean)
 	s.hooks.OnDisconnect(cl, err, expire)
 
-	if expire && !cl.IsTakenOver() {
+	// MAESTROHUB PATCH: only while the id still maps to this client — a new
+	// connection that took the session since keeps it (Clients.deleteIf).
+	if expire && !cl.IsTakenOver() && s.Clients.deleteIf(cl.ID, cl) { // [MQTT-4.1.0-2] ![MQTT-3.1.2-23]
 		cl.ClearInflights()
 		s.UnsubscribeClient(cl)
-		s.Clients.Delete(cl.ID)  // [MQTT-4.1.0-2] ![MQTT-3.1.2-23]
 		s.qos2.endSession(cl.ID) // MAESTROHUB PATCH (acks_qos2.go)
 	}
 
@@ -669,7 +670,10 @@ func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
 		existing.State.isTakenOver.Store(true)
 		_ = s.DisconnectClient(existing, packets.ErrSessionTakenOver) // [MQTT-3.1.4-3]
 		if clean {
-			s.UnsubscribeClient(existing)
+			// Upstream unsubscribed before marking (UnsubscribeClient skips
+			// the topic index for a client taken over); the mark now comes
+			// first, so the clean start removes the subscriptions itself.
+			s.unsubscribeAll(existing)
 			existing.ClearInflights()
 			s.qos2.endSession(existing.ID) // MAESTROHUB PATCH (acks_qos2.go)
 			return false                   // [MQTT-3.2.2-3]
@@ -1057,9 +1061,11 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 	// hooks on an old connection is already known to the new one; after
 	// the topic alias, which a resend may establish for what follows.
 	var qos2 *qos2Entry
+	var qos2Inherited bool          // a DUP 0 reuse of an id this connection already holds quota for
 	qos2Drop := packets.CodeSuccess // the verdict for resends waiting on a copy dropped below
 	if !cl.Net.Inline && pk.FixedHeader.Qos == 2 && s.Options.Capabilities.MaximumQos >= 2 && s.hooks.Provides(OnPublishedSettle) {
-		e, resent := s.qos2.claim(cl.ID, pk.PacketID, pk.FixedHeader.Dup)
+		e, resent, inherited := s.qos2.claim(cl.ID, pk.PacketID, pk.FixedHeader.Dup, cl)
+		qos2Inherited = inherited
 		if resent {
 			// Receive quota is taken once per connection for an id: a
 			// resend on the connection that already holds it takes none,
@@ -1129,7 +1135,9 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 		return nil
 	}
 
-	cl.State.Inflight.DecreaseReceiveQuota()
+	if !qos2Inherited { // MAESTROHUB PATCH: one quota unit per id and connection (acks_qos2.go)
+		cl.State.Inflight.DecreaseReceiveQuota()
+	}
 	ack := s.buildAck(pk.PacketID, packets.Puback, 0, pk.Properties, packets.QosCodes[pk.FixedHeader.Qos]) // [MQTT-4.3.2-4]
 	if pk.FixedHeader.Qos == 2 {
 		ack = s.buildAck(pk.PacketID, packets.Pubrec, 0, pk.Properties, packets.CodeSuccess) // [MQTT-3.3.4-1] [MQTT-4.3.3-8]
@@ -1141,7 +1149,15 @@ func (s *Server) processPublish(cl *Client, pk packets.Packet) error {
 	// is put in the inflight store until the ack is written, so a session
 	// resumed meanwhile never resends an ack for a message not handled.
 	if s.hooks.Provides(OnPublishedSettle) {
-		settlement := &PublishSettlement{cl: cl, ack: cl.State.acks.reserve(ack)}
+		var held *pendingAck
+		if qos2Inherited && pk.FixedHeader.Qos == 2 {
+			// The connection's earlier copy of this id holds its quota and
+			// its inflight entry: this PUBREC is an answer only.
+			held = cl.State.acks.queueAnswer(ack)
+		} else {
+			held = cl.State.acks.reserve(ack)
+		}
+		settlement := &PublishSettlement{cl: cl, ack: held}
 		if qos2 != nil {
 			// Handled — as QoS 2, or lowered to QoS 1 by a hook: resends
 			// waiting on it get its real verdict, never one before it.
@@ -1610,9 +1626,7 @@ func (s *Server) processUnsubscribe(cl *Client, pk packets.Packet) error {
 
 // UnsubscribeClient unsubscribes a client from all of their subscriptions.
 func (s *Server) UnsubscribeClient(cl *Client) {
-	i := 0
 	filterMap := cl.State.Subscriptions.GetAll()
-	filters := make([]packets.Subscription, len(filterMap))
 	for k := range filterMap {
 		cl.State.Subscriptions.Delete(k)
 	}
@@ -1620,7 +1634,23 @@ func (s *Server) UnsubscribeClient(cl *Client) {
 	if cl.IsTakenOver() {
 		return
 	}
+	s.unsubscribeFilters(cl, filterMap)
+}
 
+// unsubscribeAll removes cl's subscriptions from the topic index whether or
+// not cl is taken over — for a clean start, whose old session's filters must
+// stop routing to the client id ([MQTT-3.1.2-4]). MAESTROHUB PATCH.
+func (s *Server) unsubscribeAll(cl *Client) {
+	filterMap := cl.State.Subscriptions.GetAll()
+	for k := range filterMap {
+		cl.State.Subscriptions.Delete(k)
+	}
+	s.unsubscribeFilters(cl, filterMap)
+}
+
+func (s *Server) unsubscribeFilters(cl *Client, filterMap map[string]packets.Subscription) {
+	i := 0
+	filters := make([]packets.Subscription, len(filterMap))
 	for k, v := range filterMap {
 		if s.Topics.Unsubscribe(k, cl.ID) {
 			atomic.AddInt64(&s.Info.Subscriptions, -1)
@@ -1974,8 +2004,9 @@ func (s *Server) clearExpiredClients(dt int64) {
 
 		if disconnected+int64(expire) < dt {
 			s.hooks.OnClientExpired(client)
-			s.Clients.Delete(id)  // [MQTT-4.1.0-2]
-			s.qos2.endSession(id) // MAESTROHUB PATCH (acks_qos2.go)
+			if s.Clients.deleteIf(id, client) { // [MQTT-4.1.0-2] MAESTROHUB PATCH: not a client that replaced it
+				s.qos2.endSession(id) // MAESTROHUB PATCH (acks_qos2.go)
+			}
 		}
 	}
 }

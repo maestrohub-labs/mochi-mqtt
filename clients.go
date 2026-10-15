@@ -88,6 +88,21 @@ func (cl *Clients) Delete(id string) {
 	delete(cl.internal, id)
 }
 
+// deleteIf deletes id only while it still maps to c, and reports whether
+// it did. MAESTROHUB PATCH: the end of a connection's session (attachClient,
+// the expiry sweep) must not delete the session a new connection under the
+// same client id has taken since — a check-then-act on IsTakenOver alone
+// could.
+func (cl *Clients) deleteIf(id string, c *Client) bool {
+	cl.Lock()
+	defer cl.Unlock()
+	if cl.internal[id] != c {
+		return false
+	}
+	delete(cl.internal, id)
+	return true
+}
+
 // GetByListener returns clients matching a listener id.
 //
 // MAESTROHUB PATCH (deadlock): the capacity hint read cl.Len(), which takes

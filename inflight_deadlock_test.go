@@ -3,6 +3,7 @@ package mqtt
 import (
 	"io"
 	"os"
+	"path/filepath"
 	"runtime/pprof"
 	"sync/atomic"
 	"testing"
@@ -11,9 +12,10 @@ import (
 	"github.com/maestrohub-labs/mochi-mqtt/v2/packets"
 )
 
-// D1: a QoS 2 publisher whose PUBRECs are settled off the reader: the ack
-// writer's Inflight.Set (ackWritten) races the reader's NextImmediate,
-// which read-locks Inflight twice (recursive RLock) -> deadlock.
+// A QoS 2 publisher whose PUBRECs are settled off the reader: the ack
+// writer's Inflight.Set (ackWritten) runs concurrently with the reader's
+// NextImmediate. NextImmediate used to read-lock Inflight twice (a nested
+// RLock blocks behind a waiting writer); 160,000 exchanges now complete.
 type asyncHook struct{ HookBase }
 
 func (h *asyncHook) ID() string           { return "async" }
@@ -23,7 +25,7 @@ func (h *asyncHook) OnPublishedSettle(cl *Client, pk packets.Packet, s *PublishS
 	go rel(packets.CodeSuccess) // settled on a worker, as MaestroHub's pool does
 }
 
-func TestR3_NextImmediateDeadlock(t *testing.T) {
+func TestInflightNextImmediateDoesNotDeadlock(t *testing.T) {
 	s := newServer()
 	if err := s.AddHook(&asyncHook{}, nil); err != nil {
 		t.Fatal(err)
@@ -58,7 +60,7 @@ func TestR3_NextImmediateDeadlock(t *testing.T) {
 	case <-time.After(60 * time.Second):
 		a := prog.Load()
 		time.Sleep(5 * time.Second)
-		f, _ := os.Create("/tmp/claude-1000/-home-barisvelioglu-projects-maestrohub-3-maestrohub/07c13057-8182-4dbb-8da3-76e1a467f9ec/scratchpad/review-fork7c/dl-goroutines.txt")
+		f, _ := os.Create(filepath.Join(t.TempDir(), "goroutines.txt")) // rule 37: no host path
 		_ = pprof.Lookup("goroutine").WriteTo(f, 2)
 		f.Close()
 		// another client's reader delivering a QoS 1 message to this client

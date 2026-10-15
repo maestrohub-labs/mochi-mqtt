@@ -241,7 +241,7 @@ func BenchmarkReview_RegistryParallel(b *testing.B) {
 		var pid uint16
 		for pb.Next() {
 			pid++
-			e, _ := r.claim(id, pid, false)
+			e, _, _ := r.claim(id, pid, false, nil)
 			r.settle(id, pid, e, packets.CodeSuccess, nil, false)
 			r.release(id, pid)
 		}

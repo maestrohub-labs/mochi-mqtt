@@ -13,9 +13,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// A1: same-connection resend + refusal: the quota was taken once, but
-// two refused PUBRECs each return one unit.
-func TestR3_SameConnRefusalReturnsQuotaTwice(t *testing.T) {
+// A refused id answered twice on one connection (the first copy's PUBREC
+// and a resend's) returns the receive quota it took once — once.
+func TestQos2SameConnRefusalReturnsQuotaOnce(t *testing.T) {
 	s, h := newSettleServer(t)
 	cl, r, _ := newTestClient()
 	cl.Properties.ProtocolVersion = 5
@@ -38,8 +38,9 @@ func TestR3_SameConnRefusalReturnsQuotaTwice(t *testing.T) {
 	require.Equal(t, max-1, atomic.LoadInt32(&cl.State.Inflight.receiveQuota), "refused resend returned quota it never took")
 }
 
-// A1b: same on the resuming connection: two resends there, one unit taken.
-func TestR3_TakeoverTwoResendsRefusedReturnsQuotaTwice(t *testing.T) {
+// The same on the resuming connection: two resends there take one unit and
+// return one.
+func TestQos2TakeoverTwoResendsRefusedReturnQuotaOnce(t *testing.T) {
 	s, h := newSettleServer(t)
 	old := connClient(t, s)
 	old.ID = "q"
@@ -59,10 +60,10 @@ func TestR3_TakeoverTwoResendsRefusedReturnsQuotaTwice(t *testing.T) {
 	require.Equal(t, max-1, atomic.LoadInt32(&cl.State.Inflight.receiveQuota), "refused resends returned quota twice")
 }
 
-// A2: a client PUBREL carrying a failure reason (MQTT 5 0x92) ends the flow
-// (inflight deleted) but leaves the registry entry: a later DUP copy of a
-// NEW message with that id is answered from the stale entry, never handled.
-func TestR3_PubrelWithReasonLeavesStaleEntry(t *testing.T) {
+// A client PUBREL carrying a failure reason ends the flow and frees the
+// id: a later DUP copy of a NEW message with that id is handled, not
+// answered from a stale entry.
+func TestQos2FailedPubrelFreesTheId(t *testing.T) {
 	s, h := newSettleServer(t)
 	cl, r, _ := newTestClient()
 	cl.Properties.ProtocolVersion = 5
@@ -75,15 +76,16 @@ func TestR3_PubrelWithReasonLeavesStaleEntry(t *testing.T) {
 	rel.ReasonCode = packets.ErrPacketIdentifierNotFound.Code
 	require.NoError(t, s.processPacket(cl, rel))
 	_, inflight := cl.State.Inflight.Get(7)
-	t.Logf("after PUBREL 0x92: inflight=%v registry=%d", inflight, s.qos2.size())
+	require.False(t, inflight)
+	require.Equal(t, 0, s.qos2.size())
 	require.NoError(t, s.processPacket(cl, qos2Dup(7))) // new message, its first copy lost
 	require.Equal(t, int32(2), h.seen.Load(), "new message with a freed id was not handled (stale registry entry, size %d)", s.qos2.size())
 }
 
-// A3: after the PUBREC was written, a DUP=0 PUBLISH reusing the id (a
-// device that restarted its packet ids, session kept) gets 0x00 now (was
-// 0x91, "session state mismatch") and is not handled.
-func TestR3_Dup0ReuseAfterPubrecWritten(t *testing.T) {
+// After the PUBREC was written, a DUP 0 PUBLISH reusing the id (a device
+// that restarted its packet ids, session kept) gets upstream's 0x91, not
+// the stored verdict — that answers resends only.
+func TestQos2Dup0ReuseAfterPubrecGets0x91(t *testing.T) {
 	s, h := newSettleServer(t)
 	cl, r, _ := newTestClient()
 	cl.Properties.ProtocolVersion = 5
@@ -94,23 +96,24 @@ func TestR3_Dup0ReuseAfterPubrecWritten(t *testing.T) {
 	require.Eventually(t, func() bool { _, ok := cl.State.Inflight.Get(7); return ok }, time.Second, time.Millisecond)
 	require.NoError(t, s.processPacket(cl, publishQos(7, 2))) // DUP 0
 	p := expectAck(t, wire, packets.Pubrec, 7)
-	t.Logf("DUP=0 reuse answered 0x%02x, handled=%d", p.reason, h.seen.Load())
 	require.Equal(t, byte(0x91), p.reason, "DUP=0 reuse of an id awaiting PUBREL told success, message not handled")
 }
 
-// A3b: while held, DUP=0 reuse IS handled as new (inconsistent with A3).
-func TestR3_Dup0ReuseWhileHeld(t *testing.T) {
+// While the first copy is held, a DUP 0 PUBLISH reusing its id is a new
+// message: handled (its quota is checked in TestQos2Dup0WhileHeldKeepsQuota).
+func TestQos2Dup0ReuseWhileHeldIsANewMessage(t *testing.T) {
 	s, h := newSettleServer(t)
 	cl, _, _ := newTestClient()
 	cl.Properties.ProtocolVersion = 5
 	require.NoError(t, s.processPacket(cl, publishQos(7, 2)))
 	require.NoError(t, s.processPacket(cl, publishQos(7, 2)))
-	t.Logf("DUP=0 reuse while held: handled %d times", h.seen.Load())
+	require.Equal(t, int32(2), h.seen.Load(), "a DUP 0 reuse is a new message")
 }
 
-// A4: stored verdict after restart (storage hook restores inflight Pubrec,
-// registry empty): the same DUP resend now gets 0x91.
-func TestR3_VerdictAfterRestart(t *testing.T) {
+// The stored verdict lives as long as the process: a session restored from
+// storage after a restart (inflight PUBREC, empty registry) answers a DUP
+// resend with upstream's 0x91 (documented in FORK.md).
+func TestQos2ResendAfterRestartGets0x91(t *testing.T) {
 	s, _ := newSettleServer(t)
 	cl, r, _ := newTestClient()
 	cl.Properties.ProtocolVersion = 5
@@ -119,7 +122,7 @@ func TestR3_VerdictAfterRestart(t *testing.T) {
 	cl.State.Inflight.Set(rec) // as restored by a storage hook
 	require.NoError(t, s.processPacket(cl, qos2Dup(7)))
 	p := expectAck(t, wire, packets.Pubrec, 7)
-	t.Logf("resend after restart answered 0x%02x", p.reason)
+	require.Equal(t, packets.ErrPacketIdentifierInUse.Code, p.reason)
 }
 
 // lowerHook: blocks the first copy of 7 in OnPublish, then lowers it to QoS 1.
@@ -145,10 +148,9 @@ func (h *lowerHook) OnPublish(cl *Client, pk packets.Packet) (packets.Packet, er
 	return pk, nil
 }
 
-// A5: original lowered to QoS 1 by a hook; the resend waiting on the
-// resumed connection is told "received" (PUBREC 0x00) before the hook
-// has settled the original — ack before handled.
-func TestR3_LoweredToQos1AcksResendBeforeHandled(t *testing.T) {
+// A copy a hook lowered to QoS 1: a resend waiting on the resumed connection
+// is not answered before the copy is settled (it gets the copy's verdict).
+func TestQos2LoweredCopyHoldsTheResendUntilSettled(t *testing.T) {
 	s := newServer()
 	h := &lowerHook{settleHook: *newSettleHook(), gate: make(chan struct{}), entered: make(chan struct{}), to: 1}
 	require.NoError(t, s.AddHook(h, nil))
@@ -170,8 +172,9 @@ func TestR3_LoweredToQos1AcksResendBeforeHandled(t *testing.T) {
 	}
 }
 
-// A6: stress across shards: many sessions, each racing release, takeover,
-// resend, PUBREL, OnPublish rejection.
+// Stress across shards: many sessions, each racing release, takeover,
+// resend, PUBREL and an OnPublish rejection — no stuck ack, no quota or
+// registry leak, no id handled twice.
 type stressHook struct {
 	settleHook
 	rejectOdd atomic.Bool
@@ -186,7 +189,7 @@ func (h *stressHook) OnPublish(cl *Client, pk packets.Packet) (packets.Packet, e
 	return pk, nil
 }
 
-func TestR3_StressAcrossShards(t *testing.T) {
+func TestQos2StressAcrossShards(t *testing.T) {
 	const sessions = 48
 	for iter := 0; iter < 20; iter++ {
 		s := newServer()
