@@ -628,7 +628,8 @@ type above; the 15–19-byte PUBACK boundary; remaining lengths that cross
 the Variable Byte Integer boundaries (127, 16383); the Reason String kept
 before the User Properties when only one fits.
 
-**A PUBLISH is never altered (v2.7.9-mh.14).** mh.13 put PUBLISH through
+**A PUBLISH is never altered (also in v2.7.9-mh.13, fork PR #14; earlier
+drafts of this note said mh.14).** #13 put PUBLISH through
 the same drop loop, so any PUBLISH too large for the client (big
 correlation data, say) went out with its User Properties stripped. They
 are the message's own and reach the receiver unaltered ([MQTT-3.3.2-17]);
@@ -640,6 +641,91 @@ Separately (upstream too), Request Problem Information 0
 [MQTT-3.1.2-29] exempts PUBLISH; it no longer does. Tests:
 `TestPublishUserPropertiesAreNeverStripped` (packets),
 `TestOversizePublishIsDiscardedNotStripped`.
+
+### 12. A slow subscriber's messages wait in a bounded queue; the oldest is dropped, not the newest (v2.7.9-mh.14)
+
+**Upstream PR:** not yet filed (same status as patch 9).
+
+**Problem.** `publishToClient` dropped the NEW message for a subscriber
+that could not take one more:
+
+- its in-flight store held `MaximumInflight` QoS 1/2 messages — WARN
+  `client store quota reached` per message, no hook (`// add hook?`);
+- no packet id was free — WARN `packet ids exhausted` per message;
+- its outbound channel held `MaximumClientWritesPending` messages —
+  `OnPublishDropped`.
+
+A slow dashboard therefore kept the oldest values it had been sent and
+lost every newer one until it caught up. Separately, a message beyond the
+client's own Receive Maximum was parked in the in-flight store with
+`Expiry -1`, sent later in the order of its creation *second* (map order
+within a second), and deleted from the store once written: its PUBACK
+found nothing, returned no send quota, and after Receive Maximum such
+messages the client received nothing more, for good (reproduced:
+`TestReceiveMaximumQueuedMessagesAllArriveInOrder` times out on mh.13).
+
+**Fix** (`pending.go`). One per-client FIFO, `pendingQueue`, replaces both
+the drops and the `Expiry -1` parking:
+
+- A message the client cannot take now — in-flight store full, send quota
+  under the client's Receive Maximum used up, no free packet id, outbound
+  channel full — is queued. Once anything is queued, later messages queue
+  behind it, so delivery order is arrival order.
+- The queue holds at most `Capabilities.MaximumClientPendingMessages`
+  (default 8192; 0 means the default). When full, the OLDEST queued
+  message is dropped for each new one: counted in `Info.MessagesDropped`
+  and reported through `OnPublishDropped` (now the one drop signal for a
+  subscriber). No per-message WARN.
+- A queued message holds no packet id, no in-flight entry and no send
+  quota; it gets them when it is handed out. QoS 1/2 semantics are
+  unchanged from there (in flight until PUBACK/PUBCOMP, resent on resume).
+- The topic alias is assigned when a message is handed out, not on
+  arrival: a message dropped from the queue never claims an alias the
+  client was not told (upstream had the same hole for its drops).
+- Drained, oldest first, whenever room may have appeared: after the
+  reader processes a packet (PUBACK/PUBREC/PUBCOMP), after WriteLoop
+  writes an outbound packet, after the in-flight expiry sweep, and after a
+  resumed session's in-flight messages are resent. A queued message whose
+  expiry passed is deleted, not sent ([MQTT-3.3.2-5]).
+- Every send to the outbound channel happens under the queue's lock, which
+  makes the "room in outbound" check exact (WriteLoop only takes).
+- A persistent session's queue moves with it on takeover, behind its
+  in-flight messages; a clean start or session end discards it
+  (`ClearInflights`).
+- Memory: a ring of pointers grown on demand up to the limit and released
+  when it empties; the queued packets share their payload with every other
+  subscriber's copy. Bound per slow subscriber: limit × packet size.
+
+**Behaviour change for embedders.** `publishToClient` no longer returns
+`ErrQuotaExceeded` / `ErrPendingClientWritesExceeded` for these cases
+(the message is queued: `nil`), `Info.InflightDropped` is no longer
+incremented by it, and the two WARN lines are gone. MaestroHub counted
+drops from those WARNs (`drop_log_filter.go`); from mh.14 it counts
+`OnPublishDropped` only.
+
+**Tests.** `pending_test.go`: the ring drops strictly oldest first, never
+allocates past the limit, frees its buffer when empty, keeps order across
+wrap and growth; publishes queue behind queued ones; a queued QoS 1 message
+takes its packet id and in-flight entry when a PUBACK frees a slot; an
+expired queued message is deleted; a dropped queued message claims no
+topic alias; `ClearInflights` empties the queue; WriteLoop drains the queue
+as the outbound channel frees; 8 concurrent publishers against a draining
+writer lose and duplicate nothing (`-race`). `pending_tcp_test.go` (real
+TCP): a subscriber that stops acknowledging gets its window, then the 10
+newest of 100 messages in order, with the 86 oldest-queued reported
+dropped in order; queued messages follow a resumed session; a client's
+Receive Maximum is honoured and every message over it arrives in order.
+Updated upstream tests: `TestPublishToClientExceedClientWritesPending`,
+`…ExceedMaximumInflight`, `…ExhaustedPacketID` now expect the message
+queued; `TestServerProcessOutboundQos2Flow` shares the server's `Info`
+with its client. Mutation: dropping the newest instead fails 3 tests;
+removing the reader's drain fails `TestQueuedQoS1TakesItsPacketIDWhenDelivered`;
+removing WriteLoop's drain fails `TestWriteLoopDrainsTheQueueAsOutboundFrees`.
+
+**Not changed.** `ResendInflightMessages` still resends a resumed session's
+in-flight messages in creation-second order (upstream), so the resent
+window's own order is not guaranteed; the queued messages follow it in
+order.
 
 ## Upstream sync
 

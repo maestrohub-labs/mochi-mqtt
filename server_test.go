@@ -2114,15 +2114,18 @@ func TestPublishToClientExceedClientWritesPending(t *testing.T) {
 	cl.State.Inflight.DecreaseSendQuota()
 	sendQuota--
 
+	// MAESTROHUB PATCH (pending.go): queued for the client, not dropped;
+	// a queued message takes no send quota and no in-flight slot.
 	_, err := s.publishToClient(cl, packets.Subscription{Filter: "a/b/c", Qos: 2}, packets.Packet{})
-	require.Error(t, err)
-	require.ErrorIs(t, packets.ErrPendingClientWritesExceeded, err)
+	require.NoError(t, err)
 	require.Equal(t, int32(sendQuota), atomic.LoadInt32(&cl.State.Inflight.sendQuota))
 
 	_, err = s.publishToClient(cl, packets.Subscription{Filter: "a/b/c", Qos: 2}, packets.Packet{FixedHeader: packets.FixedHeader{Qos: 1}})
-	require.Error(t, err)
-	require.ErrorIs(t, packets.ErrPendingClientWritesExceeded, err)
+	require.NoError(t, err)
 	require.Equal(t, int32(sendQuota), atomic.LoadInt32(&cl.State.Inflight.sendQuota))
+	require.Equal(t, 2, cl.State.pending.Len())
+	require.Equal(t, 1, cl.State.Inflight.Len())
+	require.Equal(t, int64(0), atomic.LoadInt64(&cl.ops.info.MessagesDropped))
 }
 
 func TestPublishToClientServerTopicAlias(t *testing.T) {
@@ -2188,10 +2191,12 @@ func TestPublishToClientExceedMaximumInflight(t *testing.T) {
 		cl.State.Inflight.Set(packets.Packet{PacketID: i})
 	}
 
+	// MAESTROHUB PATCH (pending.go): queued until a slot frees, not dropped.
 	_, err := s.publishToClient(cl, packets.Subscription{Filter: "a/b/c", Qos: 1}, *packets.TPacketData[packets.Publish].Get(packets.TPublishQos1).Packet)
-	require.Error(t, err)
-	require.ErrorIs(t, err, packets.ErrQuotaExceeded)
-	require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.InflightDropped))
+	require.NoError(t, err)
+	require.Equal(t, 1, cl.State.pending.Len())
+	require.Equal(t, int(MaxInflight), cl.State.Inflight.Len())
+	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.InflightDropped))
 }
 
 func TestPublishToClientExhaustedPacketID(t *testing.T) {
@@ -2201,10 +2206,12 @@ func TestPublishToClientExhaustedPacketID(t *testing.T) {
 		cl.State.Inflight.Set(packets.Packet{PacketID: uint16(i)})
 	}
 
+	// MAESTROHUB PATCH (pending.go): queued until an id frees, not dropped.
+	cl.ops.options.Capabilities.MaximumInflight = 65535 // the ids, not the in-flight limit, run out
 	_, err := s.publishToClient(cl, packets.Subscription{Filter: "a/b/c", Qos: 1}, *packets.TPacketData[packets.Publish].Get(packets.TPublishQos1).Packet)
-	require.Error(t, err)
-	require.ErrorIs(t, err, packets.ErrQuotaExceeded)
-	require.Equal(t, int64(1), atomic.LoadInt64(&s.Info.InflightDropped))
+	require.NoError(t, err)
+	require.Equal(t, 1, cl.State.pending.Len())
+	require.Equal(t, int64(0), atomic.LoadInt64(&s.Info.InflightDropped))
 }
 
 func TestPublishToClientACLNotAuthorized(t *testing.T) {
@@ -2741,6 +2748,7 @@ func TestServerProcessOutboundQos2Flow(t *testing.T) {
 	pID := uint16(6)
 	s := newServer()
 	cl, _, _ := newTestClient()
+	cl.ops.info = s.Info // MAESTROHUB PATCH: the delivery path counts on the client's (in a server, the same) Info
 	cl.State.packetID = uint32(6)
 	cl.State.Inflight.sendQuota = 3
 	cl.State.Inflight.receiveQuota = 3
