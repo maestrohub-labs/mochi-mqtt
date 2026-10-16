@@ -64,6 +64,12 @@ type Capabilities struct {
 	WildcardSubAvailable         byte            `yaml:"wildcard_sub_available" json:"wildcard_sub_available"`     // support of wildcard subscriptions
 	SubIDAvailable               byte            `yaml:"sub_id_available" json:"sub_id_available"`                 // support of subscription identifiers
 	ConnectTimeout               int64           `yaml:"connect_timeout" json:"connect_timeout"`                   // seconds a new connection has to send its CONNECT packet before it is closed, 0 = default (15)
+	// MaximumClientPendingMessages is how many messages may wait for one
+	// client that cannot take more right now (in-flight store full, send
+	// quota used up, no free packet id, outbound channel full). When it is
+	// reached the oldest waiting message is dropped (OnPublishDropped).
+	// 0 = default (8192). MAESTROHUB PATCH (pending.go).
+	MaximumClientPendingMessages int32 `yaml:"maximum_client_pending_messages" json:"maximum_client_pending_messages"`
 }
 
 // NewDefaultServerCapabilities defines the default features and capabilities provided by the server.
@@ -85,8 +91,13 @@ func NewDefaultServerCapabilities() *Capabilities {
 		WildcardSubAvailable:         1,              // wildcard subscriptions are available
 		SubIDAvailable:               1,              // subscription identifiers are available
 		ConnectTimeout:               defaultConnectTimeout,
+		MaximumClientPendingMessages: defaultMaximumClientPendingMessages,
 	}
 }
+
+// defaultMaximumClientPendingMessages is MaximumClientPendingMessages when
+// it is not set. MAESTROHUB PATCH (pending.go).
+const defaultMaximumClientPendingMessages = 1024 * 8
 
 // connectTimeout returns how long a new connection may take to deliver its
 // CONNECT packet. [MQTT-3.1.4] "If the Server does not receive a CONNECT
@@ -301,6 +312,10 @@ func (o *Options) ensureDefaults() {
 
 	if o.Capabilities.MaximumInflight == 0 {
 		o.Capabilities.MaximumInflight = 1024 * 8
+	}
+
+	if o.Capabilities.MaximumClientPendingMessages <= 0 { // MAESTROHUB PATCH (pending.go)
+		o.Capabilities.MaximumClientPendingMessages = defaultMaximumClientPendingMessages
 	}
 
 	if o.SysTopicResendInterval == 0 {
@@ -566,6 +581,7 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 		if err != nil {
 			return fmt.Errorf("resend inflight: %w", err)
 		}
+		cl.drainPending() // MAESTROHUB PATCH: then what the session had queued (pending.go)
 	}
 
 	s.hooks.OnSessionEstablished(cl, pk)
@@ -693,6 +709,17 @@ func (s *Server) inheritClientSession(pk packets.Packet, cl *Client) bool {
 				cl.State.Inflight.ResetReceiveQuota(int32(cl.ops.options.Capabilities.ReceiveMaximum)) // server receive max per client
 				cl.State.Inflight.ResetSendQuota(int32(cl.Properties.Props.ReceiveMaximum))            // client receive max
 			}
+		}
+
+		// MAESTROHUB PATCH (pending.go): the messages the session had
+		// queued move with it, in order, behind its in-flight ones.
+		if queued := existing.State.pending.takeAll(); len(queued) > 0 {
+			limit := cl.pendingLimit()
+			cl.State.pending.mu.Lock()
+			for _, pk := range queued {
+				cl.State.pending.push(pk, limit)
+			}
+			cl.State.pending.mu.Unlock()
 		}
 
 		for _, sub := range existing.State.Subscriptions.GetAll() {
@@ -846,6 +873,10 @@ func (s *Server) processPacket(cl *Client, pk packets.Packet) error {
 	if err != nil {
 		return err
 	}
+
+	// MAESTROHUB PATCH: an ack may have freed an in-flight slot and returned
+	// send quota; hand queued messages out (pending.go).
+	cl.drainPending()
 
 	if cl.State.Inflight.Len() > 0 && atomic.LoadInt32(&cl.State.Inflight.sendQuota) > 0 {
 		next, ok := cl.State.Inflight.NextImmediate()
@@ -1286,67 +1317,12 @@ func (s *Server) publishToClient(cl *Client, sub packets.Subscription, pk packet
 		out.FixedHeader.Qos = s.Options.Capabilities.MaximumQos // [MQTT-3.2.2-9]
 	}
 
-	if cl.Properties.Props.TopicAliasMaximum > 0 {
-		var aliasExists bool
-		out.Properties.TopicAlias, aliasExists = cl.State.TopicAliases.Outbound.Set(pk.TopicName)
-		if out.Properties.TopicAlias > 0 {
-			out.Properties.TopicAliasFlag = true
-			if aliasExists {
-				out.TopicName = ""
-			}
-		}
-	}
-
-	if out.FixedHeader.Qos > 0 {
-		if cl.State.Inflight.Len() >= int(s.Options.Capabilities.MaximumInflight) {
-			// add hook?
-			atomic.AddInt64(&s.Info.InflightDropped, 1)
-			s.Log.Warn("client store quota reached", "client", cl.ID, "listener", cl.Net.Listener)
-			return out, packets.ErrQuotaExceeded
-		}
-
-		i, err := cl.NextPacketID() // [MQTT-4.3.2-1] [MQTT-4.3.3-1]
-		if err != nil {
-			s.hooks.OnPacketIDExhausted(cl, pk)
-			atomic.AddInt64(&s.Info.InflightDropped, 1)
-			s.Log.Warn("packet ids exhausted", "error", err, "client", cl.ID, "listener", cl.Net.Listener)
-			return out, packets.ErrQuotaExceeded
-		}
-
-		out.PacketID = uint16(i) // [MQTT-2.2.1-4]
-		sentQuota := atomic.LoadInt32(&cl.State.Inflight.sendQuota)
-
-		if ok := cl.State.Inflight.Set(out); ok { // [MQTT-4.3.2-3] [MQTT-4.3.3-3]
-			atomic.AddInt64(&s.Info.Inflight, 1)
-			s.hooks.OnQosPublish(cl, out, out.Created, 0)
-			cl.State.Inflight.DecreaseSendQuota()
-		}
-
-		if sentQuota == 0 && atomic.LoadInt32(&cl.State.Inflight.maximumSendQuota) > 0 {
-			out.Expiry = -1
-			cl.State.Inflight.Set(out)
-			return out, nil
-		}
-	}
-
-	if cl.Net.Conn == nil || cl.Closed() {
-		return out, packets.CodeDisconnect
-	}
-
-	select {
-	case cl.State.outbound <- &out:
-		atomic.AddInt32(&cl.State.outboundQty, 1)
-	default:
-		atomic.AddInt64(&s.Info.MessagesDropped, 1)
-		cl.ops.hooks.OnPublishDropped(cl, pk)
-		if out.FixedHeader.Qos > 0 {
-			cl.State.Inflight.Delete(out.PacketID) // packet was dropped due to irregular circumstances, so rollback inflight.
-			cl.State.Inflight.IncreaseSendQuota()
-		}
-		return out, packets.ErrPendingClientWritesExceeded
-	}
-
-	return out, nil
+	// MAESTROHUB PATCH (pending.go): handed out now, or queued for the
+	// client — never dropped while its queue has room, and when it is full
+	// the oldest queued message is dropped instead of this one. The topic
+	// alias, packet id and in-flight entry are assigned when it is handed
+	// out.
+	return cl.publish(out)
 }
 
 func (s *Server) publishRetainedToClient(cl *Client, sub packets.Subscription, existed bool) {
@@ -2048,6 +2024,7 @@ func (s *Server) clearExpiredInflights(now int64) {
 				s.hooks.OnQosDropped(client, packets.Packet{PacketID: id})
 			}
 		}
+		client.drainPending() // MAESTROHUB PATCH: freed slots, and expired queued messages go (pending.go)
 	}
 }
 

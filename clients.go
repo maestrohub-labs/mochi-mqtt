@@ -178,6 +178,7 @@ type ClientState struct {
 	Subscriptions   *Subscriptions       // a map of the subscription filters a client maintains
 	disconnected    int64                // the time the client disconnected in unix time, for calculating expiry
 	outbound        chan *packets.Packet // queue for pending outbound packets
+	pending         pendingQueue         // messages waiting for room, oldest first (MAESTROHUB PATCH, pending.go)
 	endOnce         sync.Once            // only end once
 	isTakenOver     atomic.Bool          // used to identify orphaned clients
 	fate            atomic.Int32         // MAESTROHUB PATCH: what became of the session, decided once (claimTakeover / claimEnd)
@@ -244,6 +245,7 @@ func (cl *Client) WriteLoop() {
 				_ = cl.flushPending()
 			}
 			atomic.AddInt32(&cl.State.outboundQty, -1)
+			cl.drainPending() // MAESTROHUB PATCH: a slot in outbound is free (pending.go)
 		case <-cl.State.open.Done():
 			// Acks handed over before the close was seen: written to a
 			// closed connection they go nowhere, but writing is reset, so
@@ -377,6 +379,9 @@ func (cl *Client) ResendInflightMessages(force bool) error {
 }
 
 // ClearInflights deletes all inflight messages for the client, e.g. for a disconnected user with a clean session.
+//
+// MAESTROHUB PATCH: and the messages queued behind them (pending.go) — every
+// caller discards the session's delivery state, of which the queue is part.
 func (cl *Client) ClearInflights() {
 	for _, tk := range cl.State.Inflight.GetAll(false) {
 		if ok := cl.State.Inflight.Delete(tk.PacketID); ok {
@@ -384,6 +389,7 @@ func (cl *Client) ClearInflights() {
 			atomic.AddInt64(&cl.ops.info.Inflight, -1)
 		}
 	}
+	cl.State.pending.takeAll()
 }
 
 // ClearExpiredInflights deletes any inflight messages which have expired.
