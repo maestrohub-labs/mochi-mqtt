@@ -691,7 +691,13 @@ the drops and the `Expiry -1` parking:
   makes the "room in outbound" check exact (WriteLoop only takes).
 - A persistent session's queue moves with it on takeover, behind its
   in-flight messages; a clean start or session end discards it
-  (`ClearInflights`).
+  (`ClearInflights`). A client without a connection is never drained
+  (v2.7.9-mh.15): mh.14 moved its queued QoS 1/2 messages into its
+  in-flight store, and when that happened after a takeover had cloned the
+  store (the closed client's WriteLoop finishing a write, or the expiry
+  sweep), they were lost to the resumed session.
+  `TestDrainPendingLeavesAClosedClientsQueueWhole` (fails without the
+  guard).
 - Memory: a ring of pointers grown on demand up to the limit and released
   when it empties; the queued packets share their payload with every other
   subscriber's copy. Bound per slow subscriber: limit × packet size.

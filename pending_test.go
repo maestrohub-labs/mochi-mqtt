@@ -250,6 +250,27 @@ func TestTopicAliasAssignedOnlyToDeliveredMessages(t *testing.T) {
 	require.True(t, a.Properties.TopicAliasFlag)
 }
 
+// A closed client's queue is not drained into its in-flight store: a
+// takeover clones that store and then takes the queue, so a QoS 1 message
+// moved between the two would be lost to the resumed session.
+func TestDrainPendingLeavesAClosedClientsQueueWhole(t *testing.T) {
+	cl, _, _ := newTestClientNoWriteLoop()
+	cl.ops.options.Capabilities.MaximumInflight = 10
+	for i := 0; i < 3; i++ {
+		pk := numbered(i)
+		pk.FixedHeader.Qos = 1
+		cl.State.pending.mu.Lock()
+		cl.State.pending.push(pk, 10)
+		cl.State.pending.mu.Unlock()
+	}
+	cl.Stop(errClientStop)
+
+	cl.drainPending() // what its WriteLoop or the expiry sweep may do while a takeover runs
+
+	require.Equal(t, 3, cl.State.pending.Len(), "the queue must stay whole, to move with the session")
+	require.Equal(t, 0, cl.State.Inflight.Len(), "queued messages must not land in a store the takeover may already have cloned")
+}
+
 // A session's delivery state is discarded as a whole: its queue too.
 func TestClearInflightsEmptiesThePendingQueue(t *testing.T) {
 	cl, _, _ := newTestClientNoWriteLoop()

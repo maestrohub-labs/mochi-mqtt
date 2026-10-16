@@ -239,6 +239,15 @@ func (cl *Client) drainPending() {
 	if q.Len() == 0 {
 		return
 	}
+	// A client without a connection keeps its queue as it is: the queue
+	// moves whole to the connection that resumes the session
+	// (inheritClientSession). Moving queued QoS 1/2 messages into this
+	// client's in-flight store instead would lose them whenever it happens
+	// after a takeover cloned that store — and the closed client's own
+	// WriteLoop and the expiry sweep do drain at that moment.
+	if cl.Net.Conn == nil || cl.Closed() {
+		return
+	}
 
 	now := time.Now().Unix()
 	maxExpiry := cl.ops.options.Capabilities.MaximumMessageExpiryInterval
