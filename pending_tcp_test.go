@@ -272,10 +272,9 @@ func TestQueuedMessagesFollowAResumedSession(t *testing.T) {
 		got = append(got, string(pk.Payload))
 		c2.ack(t, pk.PacketID)
 	}
-	// The resent window's own order is upstream's (ResendInflightMessages
-	// sorts by creation second); the queued messages follow it in order.
-	require.ElementsMatch(t, span(0, window), got[:window])
-	require.Equal(t, span(window, 10), got[window:])
+	// The resent window in the order it was sent (patch 13), then the
+	// queued messages, in order.
+	require.Equal(t, span(0, 10), got)
 	c2.nothingMore(t)
 }
 

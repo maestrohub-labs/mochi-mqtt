@@ -733,6 +733,82 @@ in-flight messages in creation-second order (upstream), so the resent
 window's own order is not guaranteed; the queued messages follow it in
 order.
 
+### 13. A resumed session gets its backlog in the order it was sent; an embedder can withdraw queued messages before it resumes (v2.7.9-mh.16)
+
+**Upstream PR:** the ordering half overlaps mochi-mqtt/server#529 (a
+`Created`-then-packet-id tie-break, not filed by MaestroHub); the rest is
+not yet filed.
+
+**Problem.** Found while making MaestroHub keep persistent sessions
+(maestrohub#7101): with a session kept across a disconnect, every QoS 1
+message published while it was offline was delivered on resume, but in a
+random order.
+
+- `Inflight.GetAll` (the re-send path, `ResendInflightMessages`) sorted on
+  `uint16(Created)`. `Created` is in seconds, so a whole backlog shares one
+  key; `sort.Slice` over a map then returns it in random order — against
+  [MQTT-4.6.0-1] ("re-send them in the order in which the original PUBLISH
+  packets were sent"). The `uint16` truncation also wrapped every 18.2 h.
+  A packet-id tie-break (#529) is not enough: ids wrap at 65535, and an
+  offline backlog of a few thousand messages crosses the wrap.
+- A message published while a session was resuming — registered under its
+  client id, CONNACK written, in-flight messages not re-sent yet — was
+  handed out at once, overtook the whole backlog, and was then sent a
+  second time by the re-send (it was in the in-flight store by then).
+- An embedder that re-decides what a session may receive (a permission
+  withdrawn while it was offline) could reach the in-flight store but not
+  the pending queue (patch 12, unexported), so it could neither withhold
+  queued messages nor count them.
+
+**Fix.**
+
+- `inflight.go`: the store numbers each packet id when it is first stored
+  (`order`, `next`); `GetAll` returns that order. Replacing a packet under
+  its id (a QoS 2 PUBLISH by its PUBREL) keeps its place; a deleted id that
+  is reused goes to the end; `Clone` (a takeover) keeps and continues the
+  numbering. `Created` is no longer part of the order (a wall clock that
+  steps back would reorder it too).
+- `pending.go` / `server.go`: a resumed session's queue is held
+  (`holdPending`, set before the client is registered) until its in-flight
+  messages are re-sent; a message arriving meanwhile queues behind the
+  backlog, and `releasePending` then drains it in order. WriteLoop and the
+  expiry sweep do not drain a held queue.
+- `pending.go`: `Client.RemoveQueued(remove func(packets.Packet) bool) int`
+  removes the matching PUBLISH packets from the in-flight store (returning
+  their send quota and `Info.Inflight`, reported via `OnQosDropped` as
+  `ClearInflights` does) and from the pending queue (the rest keeps its
+  order), under the queue lock so nothing moves between the two. PUBREL
+  and inbound QoS 2 entries are never touched.
+- `server.go`: `Server.EndSession(cl) bool` ends an offline session at once
+  (as its expiry would: in-flight, queue, subscriptions, client id), via
+  the same `claimEnd` as the tail and the expiry sweep, so it never ends a
+  session a new connection took over. For an embedder that may not keep a
+  session (identity revoked, a cap on kept sessions).
+
+**Tests.** `resume_order_test.go`: same-second packets whose ids wrap come
+back in send order (50 trials); no reorder across a 65536 s boundary;
+order survives replace / delete-reuse / clone; `RemoveQueued` filters both
+stores, returns quota and the in-flight count, keeps PUBREL/PUBREC and the
+queue's order. `resume_order_tcp_test.go` (real TCP): a 200-message
+offline backlog arrives in publish order; a backlog deeper than the window
+arrives in order (window then queue); messages removed before the resume
+are not delivered; a publish made at the CONNACK of a resuming session
+arrives after the backlog, once. `TestQueuedMessagesFollowAResumedSession`
+now asserts the full order (it allowed the window in any order). All fail
+before the fix. Mutations: a packet-id-only sort fails the three ordering
+unit tests; dropping the pending pass of `RemoveQueued` fails both removal
+tests; dropping the hold fails `TestPublishDuringResumeFollowsTheBacklog`;
+an `EndSession` that only claims the end fails
+`TestEndSessionDiscardsAnOfflineSession` (which also pins that a taken-over
+session is not ended).
+
+**Not changed.** Messages published to the OLD client after
+`inheritClientSession` has moved its queue and in-flight store, but before
+the new client is registered, still land on the old client and are lost
+with it (upstream; a window of a few microseconds per takeover).
+`loadInflight` (storage hooks) stores restored packets in the storage's
+order.
+
 ## Upstream sync
 
 ```sh

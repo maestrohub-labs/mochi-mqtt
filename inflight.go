@@ -20,12 +20,20 @@ type Inflight struct {
 	sendQuota           int32                     // remaining outbound qos quota for flow control
 	maximumReceiveQuota int32                     // maximum allowed receive quota
 	maximumSendQuota    int32                     // maximum allowed send quota
+
+	// MAESTROHUB PATCH 13: order is when each packet id was stored, from
+	// next — the order the packets were sent, which GetAll returns
+	// [MQTT-4.6.0-1]. Created cannot give it: it is in seconds (a whole
+	// window shares one), and a packet id wraps.
+	order map[uint16]uint64
+	next  uint64
 }
 
 // NewInflights returns a new instance of an Inflight packets map.
 func NewInflights() *Inflight {
 	return &Inflight{
 		internal: map[uint16]packets.Packet{},
+		order:    map[uint16]uint64{},
 	}
 }
 
@@ -36,6 +44,13 @@ func (i *Inflight) Set(m packets.Packet) bool {
 
 	_, ok := i.internal[m.PacketID]
 	i.internal[m.PacketID] = m
+	if !ok { // a packet replaced under its id (PUBLISH by PUBREL) keeps its place
+		if i.order == nil {
+			i.order = map[uint16]uint64{}
+		}
+		i.next++
+		i.order[m.PacketID] = i.next
+	}
 	return !ok
 }
 
@@ -67,6 +82,10 @@ func (i *Inflight) Clone() *Inflight {
 	for k, v := range i.internal {
 		c.internal[k] = v
 	}
+	for k, v := range i.order {
+		c.order[k] = v
+	}
+	c.next = i.next
 	return c
 }
 
@@ -82,8 +101,12 @@ func (i *Inflight) GetAll(immediate bool) []packets.Packet {
 		}
 	}
 
-	sort.Slice(m, func(i, j int) bool {
-		return uint16(m[i].Created) < uint16(m[j].Created)
+	// MAESTROHUB PATCH 13: in the order stored, which is the order sent
+	// [MQTT-4.6.0-1]. Upstream sorted on uint16(Created): every packet of
+	// the same second compared equal (an unstable sort over a map, so a
+	// random order), and the truncation wrapped every 18.2 hours.
+	sort.Slice(m, func(a, b int) bool {
+		return i.order[m[a].PacketID] < i.order[m[b].PacketID]
 	})
 
 	return m
@@ -114,6 +137,7 @@ func (i *Inflight) Delete(id uint16) bool {
 
 	_, ok := i.internal[id]
 	delete(i.internal, id)
+	delete(i.order, id)
 
 	return ok
 }

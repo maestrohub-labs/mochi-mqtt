@@ -48,6 +48,12 @@ type pendingQueue struct {
 	head int
 	n    int
 	size atomic.Int32 // n, for the lock-free emptiness check on hot paths
+
+	// held: the session is resuming and its in-flight messages have not
+	// been re-sent yet, so nothing is handed out — a new message queues
+	// behind the backlog instead of overtaking it [MQTT-4.6.0-1]. Under mu.
+	// MAESTROHUB PATCH 13.
+	held bool
 }
 
 // Len returns the number of queued messages.
@@ -144,7 +150,7 @@ func (cl *Client) publish(out packets.Packet) (packets.Packet, error) {
 
 	q := &cl.State.pending
 	q.mu.Lock()
-	if q.n == 0 {
+	if q.n == 0 && !q.held {
 		if ok, err := cl.deliverNow(&out); ok {
 			q.mu.Unlock()
 			return out, err
@@ -254,6 +260,9 @@ func (cl *Client) drainPending() {
 
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	if q.held {
+		return // resuming: the backlog is re-sent first (releasePending)
+	}
 	for pk := q.front(); pk != nil; pk = q.front() {
 		if pendingExpired(pk, now, maxExpiry) {
 			q.pop()
@@ -266,6 +275,22 @@ func (cl *Client) drainPending() {
 	}
 }
 
+// holdPending stops handing messages out until releasePending: set while a
+// resumed session's backlog has not been re-sent. MAESTROHUB PATCH 13.
+func (cl *Client) holdPending() {
+	cl.State.pending.mu.Lock()
+	cl.State.pending.held = true
+	cl.State.pending.mu.Unlock()
+}
+
+// releasePending ends holdPending and hands out what queued meanwhile.
+func (cl *Client) releasePending() {
+	cl.State.pending.mu.Lock()
+	cl.State.pending.held = false
+	cl.State.pending.mu.Unlock()
+	cl.drainPending()
+}
+
 // pendingExpired reports whether a queued message may no longer be
 // delivered: its Message Expiry Interval has passed, or it is older than
 // the server's maximum message expiry (as for in-flight messages,
@@ -274,4 +299,58 @@ func pendingExpired(pk *packets.Packet, now, maximumExpiry int64) bool {
 	expired := pk.Expiry > 0 && pk.Expiry < now
 	enforced := maximumExpiry > 0 && now-pk.Created > maximumExpiry
 	return expired || enforced
+}
+
+// RemoveQueued removes from the client's session every queued PUBLISH for
+// which remove returns true — in its in-flight store (sent or waiting to be
+// resent, not yet acknowledged) and in its pending queue — and returns how
+// many it removed. Every other packet stays, in its order: a PUBREL the
+// client is owed, an inbound QoS 2 flow, the publishes remove keeps.
+//
+// For an embedder that re-decides what a session may receive, typically a
+// persistent session about to resume (OnSessionEstablish, on the session
+// still held under the client id): a permission withdrawn while it was
+// offline then withholds what was queued for it before. A removed in-flight
+// message returns its send quota and is reported through OnQosDropped, as
+// when a session's in-flight messages are cleared; a removed pending one
+// is not reported (it was never handed out). MAESTROHUB PATCH 13.
+func (cl *Client) RemoveQueued(remove func(pk packets.Packet) bool) int {
+	q := &cl.State.pending
+	// Held throughout: every move from the queue into the in-flight store
+	// (deliverNow) happens under it, so no message slips between the two
+	// passes.
+	q.mu.Lock()
+	defer q.mu.Unlock()
+
+	n := 0
+	for _, pk := range cl.State.Inflight.GetAll(false) {
+		if pk.FixedHeader.Type != packets.Publish || !remove(pk) {
+			continue
+		}
+		if cl.State.Inflight.Delete(pk.PacketID) {
+			if pk.FixedHeader.Qos > 0 {
+				cl.State.Inflight.IncreaseSendQuota()
+			}
+			atomic.AddInt64(&cl.ops.info.Inflight, -1)
+			cl.ops.hooks.OnQosDropped(cl, pk)
+			n++
+		}
+	}
+
+	if q.n == 0 {
+		return n
+	}
+	kept := make([]*packets.Packet, 0, q.n)
+	for pk := q.pop(); pk != nil; pk = q.pop() {
+		if remove(*pk) {
+			n++
+			continue
+		}
+		kept = append(kept, pk)
+	}
+	limit := cl.pendingLimit()
+	for _, pk := range kept {
+		q.push(pk, limit)
+	}
+	return n
 }

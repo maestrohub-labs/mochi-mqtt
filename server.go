@@ -567,6 +567,11 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 	s.hooks.OnSessionEstablish(cl, pk)
 
 	sessionPresent := s.inheritClientSession(pk, cl)
+	if sessionPresent {
+		// MAESTROHUB PATCH 13: from Add on, publishes reach cl; until its
+		// backlog is re-sent they queue behind it (pending.go).
+		cl.holdPending()
+	}
 	s.Clients.Add(cl) // [MQTT-4.1.0-1]
 
 	err = s.SendConnack(cl, code, sessionPresent, nil) // [MQTT-3.1.4-5] [MQTT-3.2.0-1] [MQTT-3.2.0-2] &[MQTT-3.14.0-1]
@@ -581,7 +586,7 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 		if err != nil {
 			return fmt.Errorf("resend inflight: %w", err)
 		}
-		cl.drainPending() // MAESTROHUB PATCH: then what the session had queued (pending.go)
+		cl.releasePending() // MAESTROHUB PATCH: then what the session had queued, and what arrived meanwhile (pending.go)
 	}
 
 	s.hooks.OnSessionEstablished(cl, pk)
@@ -1985,6 +1990,21 @@ func (s *Server) clearExpiredClients(dt int64) {
 			s.endSessionOf(client) // [MQTT-4.1.0-2]
 		}
 	}
+}
+
+// EndSession ends the session of cl, a client whose connection has ended,
+// at once instead of when it expires: its in-flight and queued messages and
+// its subscriptions are discarded and its client id released, as when it
+// expires. It reports false, doing nothing, when the session already ended
+// or was taken over by a new connection (which owns it now). For an
+// embedder that decides a session may not be kept — its identity revoked,
+// or a cap on kept sessions reached. MAESTROHUB PATCH 13.
+func (s *Server) EndSession(cl *Client) bool {
+	if cl == nil || !cl.claimEnd() {
+		return false
+	}
+	s.endSessionOf(cl)
+	return true
 }
 
 // endSessionOf ends cl's session for whoever claimed its end (claimEnd):
