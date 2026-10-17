@@ -1992,6 +1992,21 @@ func (s *Server) clearExpiredClients(dt int64) {
 	}
 }
 
+// EndSession ends the session of cl, a client whose connection has ended,
+// at once instead of when it expires: its in-flight and queued messages and
+// its subscriptions are discarded and its client id released, as when it
+// expires. It reports false, doing nothing, when the session already ended
+// or was taken over by a new connection (which owns it now). For an
+// embedder that decides a session may not be kept — its identity revoked,
+// or a cap on kept sessions reached. MAESTROHUB PATCH 13.
+func (s *Server) EndSession(cl *Client) bool {
+	if cl == nil || !cl.claimEnd() {
+		return false
+	}
+	s.endSessionOf(cl)
+	return true
+}
+
 // endSessionOf ends cl's session for whoever claimed its end (claimEnd):
 // its inflights, its subscriptions (the topic index, Info.Subscriptions,
 // OnUnsubscribed — upstream's sweep left them all behind), the client id

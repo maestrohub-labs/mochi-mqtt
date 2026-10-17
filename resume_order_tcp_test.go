@@ -157,3 +157,34 @@ func TestPublishDuringResumeFollowsTheBacklog(t *testing.T) {
 	require.Equal(t, append(span(0, sent), "live"), readAll(t, c2, sent+1))
 	c2.nothingMore(t)
 }
+
+// EndSession discards an offline session at once: the next CONNECT under
+// its client id finds no session, nothing it had queued is delivered, and
+// its subscription is gone. A second call, or one on a session a new
+// connection took over, does nothing.
+func TestEndSessionDiscardsAnOfflineSession(t *testing.T) {
+	s, addr, _ := startQueueBroker(t, 4, 100)
+	c, _ := connectSubscriber(t, addr, "ended", 0, false)
+	c.subscribe(t)
+	cl := goOffline(t, s, c, "ended")
+	publishNumbered(t, s, 0, 10)
+
+	require.True(t, s.EndSession(cl))
+	require.False(t, s.EndSession(cl), "ended once")
+	_, ok := s.Clients.Get("ended")
+	require.False(t, ok, "the client id is released")
+
+	c2, present := connectSubscriber(t, addr, "ended", 0, false)
+	require.False(t, present)
+	publishNumbered(t, s, 10, 11)
+	c2.nothingMore(t) // neither the backlog nor, without a subscription, the new one
+
+	// A session taken over belongs to the new connection.
+	c2.subscribe(t)
+	old := goOffline(t, s, c2, "ended")
+	c3, present := connectSubscriber(t, addr, "ended", 0, false)
+	require.True(t, present)
+	require.False(t, s.EndSession(old), "taken over: not the old client's to end")
+	publishNumbered(t, s, 11, 12)
+	require.Equal(t, []string{"11"}, readAll(t, c3, 1))
+}

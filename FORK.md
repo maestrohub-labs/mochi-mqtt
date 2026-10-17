@@ -779,6 +779,11 @@ random order.
   `ClearInflights` does) and from the pending queue (the rest keeps its
   order), under the queue lock so nothing moves between the two. PUBREL
   and inbound QoS 2 entries are never touched.
+- `server.go`: `Server.EndSession(cl) bool` ends an offline session at once
+  (as its expiry would: in-flight, queue, subscriptions, client id), via
+  the same `claimEnd` as the tail and the expiry sweep, so it never ends a
+  session a new connection took over. For an embedder that may not keep a
+  session (identity revoked, a cap on kept sessions).
 
 **Tests.** `resume_order_test.go`: same-second packets whose ids wrap come
 back in send order (50 trials); no reorder across a 65536 s boundary;
@@ -792,7 +797,10 @@ arrives after the backlog, once. `TestQueuedMessagesFollowAResumedSession`
 now asserts the full order (it allowed the window in any order). All fail
 before the fix. Mutations: a packet-id-only sort fails the three ordering
 unit tests; dropping the pending pass of `RemoveQueued` fails both removal
-tests; dropping the hold fails `TestPublishDuringResumeFollowsTheBacklog`.
+tests; dropping the hold fails `TestPublishDuringResumeFollowsTheBacklog`;
+an `EndSession` that only claims the end fails
+`TestEndSessionDiscardsAnOfflineSession` (which also pins that a taken-over
+session is not ended).
 
 **Not changed.** Messages published to the OLD client after
 `inheritClientSession` has moved its queue and in-flight store, but before
