@@ -567,6 +567,11 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 	s.hooks.OnSessionEstablish(cl, pk)
 
 	sessionPresent := s.inheritClientSession(pk, cl)
+	if sessionPresent {
+		// MAESTROHUB PATCH 13: from Add on, publishes reach cl; until its
+		// backlog is re-sent they queue behind it (pending.go).
+		cl.holdPending()
+	}
 	s.Clients.Add(cl) // [MQTT-4.1.0-1]
 
 	err = s.SendConnack(cl, code, sessionPresent, nil) // [MQTT-3.1.4-5] [MQTT-3.2.0-1] [MQTT-3.2.0-2] &[MQTT-3.14.0-1]
@@ -581,7 +586,7 @@ func (s *Server) attachClient(cl *Client, listener string) error {
 		if err != nil {
 			return fmt.Errorf("resend inflight: %w", err)
 		}
-		cl.drainPending() // MAESTROHUB PATCH: then what the session had queued (pending.go)
+		cl.releasePending() // MAESTROHUB PATCH: then what the session had queued, and what arrived meanwhile (pending.go)
 	}
 
 	s.hooks.OnSessionEstablished(cl, pk)
