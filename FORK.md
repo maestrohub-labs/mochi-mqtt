@@ -809,6 +809,31 @@ with it (upstream; a window of a few microseconds per takeover).
 `loadInflight` (storage hooks) stores restored packets in the storage's
 order.
 
+### 14. A server with a maximum packet size announces it in the CONNACK (v2.7.9-mh.17)
+
+**Upstream PR:** not yet filed.
+
+**Problem.** Found while bounding MaestroHub's embedded broker to its
+ingress payload limit (`modules.uns.ingress.maxPayloadBytes`, 1 MiB by
+default; it was 256 MB). `Capabilities.MaximumPacketSize` was enforced
+when reading a packet (`ReadFixedHeader`, [MQTT-3.2.2-15]'s server side)
+but never written to the CONNACK, so an MQTT 5 client could not know the
+limit. The spec binds a client only to an announced Maximum Packet Size
+(3.2.2.3.6). Left unsaid, a client sends a larger packet, which the server
+refuses with a disconnect.
+
+**Fix.** `SendConnack` writes the Maximum Packet Size property when
+`Capabilities.MaximumPacketSize` is set. It is written only when set, so a
+default server's CONNACK, and every fixture, is unchanged. MQTT 3.1.1 has
+no CONNACK properties and is not affected.
+
+**Tests.** `server_maestrohub_packetsize_test.go` covers three cases:
+- With a limit set, the MQTT 5 CONNACK carries it.
+- Without a limit, the property is absent.
+- The MQTT 3.1.1 CONNACK is byte-identical with or without a limit.
+
+The first test fails before the fix.
+
 ## Upstream sync
 
 ```sh
