@@ -790,6 +790,15 @@ func (s *Server) SendConnack(cl *Client, reason packets.Code, present bool, prop
 		properties.MaximumQosFlag = true
 	}
 
+	// MAESTROHUB PATCH (FORK.md patch 14): a server with a packet limit
+	// announces it (3.2.2.3.6). The client is bound only by an announced
+	// limit ([MQTT-3.2.2-15]); left unsaid, a client sends a packet the
+	// server then refuses with 0x95 and a disconnect. Written only when
+	// set, so a default server's CONNACK is unchanged.
+	if s.Options.Capabilities.MaximumPacketSize > 0 {
+		properties.MaximumPacketSize = s.Options.Capabilities.MaximumPacketSize
+	}
+
 	// A capability the server lacks must be announced: absent means
 	// available (3.2.2.3.12, 3.2.2.3.13), and a client that is not told
 	// sends subscription identifiers and shared subscriptions the server
